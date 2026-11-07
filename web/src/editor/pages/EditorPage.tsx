@@ -14,10 +14,10 @@ import {
   type Transform,
 } from '@shared/scene.ts'
 import { api, ApiError, type ProjectDetail } from '../api.ts'
-import { compileTarget } from '../compile.ts'
+import { getCompileJob, startCompileJob, subscribeCompileJob, type CompileJob } from '../compileJobs.ts'
 import { PlacementEditor } from '../components/PlacementEditor.tsx'
 import { ThreePreview } from '../components/ThreePreview.tsx'
-import { downscale, formatBytes, loadImage, videoMeta } from '../media.ts'
+import { formatBytes, loadImage, videoMeta } from '../media.ts'
 import { navigate } from '../router.ts'
 
 type SaveState = 'saved' | 'dirty' | 'saving' | 'error'
@@ -54,6 +54,8 @@ export function EditorPage({ id }: { id: string }) {
   const dirtyRef = useRef(false)
   const failCountRef = useRef(0)
   const saveSeqRef = useRef(0)
+  const latestRef = useRef<{ scene: Scene | null; name: string }>({ scene: null, name: '' })
+  latestRef.current = { scene, name }
 
   // ---- 読み込み
   useEffect(() => {
@@ -72,6 +74,32 @@ export function EditorPage({ id }: { id: string }) {
     dirtyRef.current = true
     setSaveState('dirty')
   }, [])
+
+  // D-04: 画面を離れるとき（SPA 遷移 = アンマウント / タブを閉じる）に未保存の変更を即時送信する
+  const flushNow = useCallback(() => {
+    const { scene: s, name: n } = latestRef.current
+    if (!dirtyRef.current || !s) return
+    dirtyRef.current = false
+    fetch(`/api/projects/${id}`, {
+      method: 'PATCH',
+      credentials: 'same-origin',
+      keepalive: true,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: n.trim() || undefined, draftScene: s }),
+    }).catch(() => {})
+  }, [id])
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (!dirtyRef.current) return
+      flushNow()
+      e.preventDefault()
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => {
+      window.removeEventListener('beforeunload', onBeforeUnload)
+      flushNow()
+    }
+  }, [flushNow])
 
   // ---- 自動保存（FR-4-7: 2 秒デバウンス。Q16: 3 回連続失敗で案内）
   const save = useCallback(async () => {
@@ -117,22 +145,47 @@ export function EditorPage({ id }: { id: string }) {
 
   const addAsset = (a: AssetInfo) => setDetail((d) => (d ? { ...d, assets: { ...d.assets, [a.id]: a } } : d))
 
-  // ---- FR-3: ターゲット画像
-  const compileAndStore = useCallback(
-    async (img: HTMLImageElement) => {
-      setCompile({ running: true, progress: 0, error: null })
-      try {
-        const small = await downscale(img, 1024)
-        const r = await compileTarget(small, (p) => setCompile((c) => ({ ...c, progress: p })))
-        const mind = await api.uploadAsset(id, 'target_mind', r.mind)
-        addAsset(mind.asset)
-        setScene((s) => ({ ...s, target: { ...s.target, mindAssetId: mind.asset.id, quality: r.quality, featureCount: r.featureCount } }))
+  // ---- FR-3: ターゲット画像（解析は compileJobs で画面遷移後も継続。D-04）
+  const applyJob = useCallback(
+    (job: CompileJob) => {
+      if (job.status === 'running') setCompile({ running: true, progress: job.progress, error: null })
+      else if (job.status === 'error') setCompile({ running: false, progress: 0, error: job.error })
+      else {
         setCompile({ running: false, progress: 100, error: null })
-      } catch (e) {
-        setCompile({ running: false, progress: 0, error: e instanceof ApiError ? e.message : '画像の解析に失敗しました。別の画像をお試しください' })
+        if (job.result && !job.consumed) {
+          job.consumed = true
+          const patch = job.result
+          setScene((s) => (s.target.imageAssetId === job.imageAssetId ? { ...s, target: { ...s.target, ...patch } } : s))
+          setDetail((d) => (d ? { ...d, assets: { ...d.assets, [patch.mindAssetId!]: { id: patch.mindAssetId!, kind: 'target_mind', mime: 'application/octet-stream', sizeBytes: 0, width: null, height: null, url: `/a/${patch.mindAssetId}.mind` } } } : d))
+        }
       }
     },
-    [id, setScene],
+    [setScene],
+  )
+  // ジョブの購読は 1 本に保ち、画面を離れるときに必ず解除する（解除しないと「画面が開いている」と誤認され、サーバ側の保存が行われない）
+  const unsubRef = useRef<() => void>(() => {})
+  const subscribeNow = useCallback(() => {
+    unsubRef.current()
+    unsubRef.current = subscribeCompileJob(id, applyJob)
+  }, [id, applyJob])
+  // 戻ってきたときに進行中 / 完了済みのジョブを取り込む
+  useEffect(() => {
+    const job = getCompileJob(id)
+    if (job) applyJob(job)
+    subscribeNow()
+    return () => {
+      unsubRef.current()
+      unsubRef.current = () => {}
+    }
+  }, [id, applyJob, subscribeNow])
+
+  const compileAndStore = useCallback(
+    (img: HTMLImageElement | string, imageAssetId: string) => {
+      const job = startCompileJob(id, imageAssetId, img)
+      applyJob(job)
+      subscribeNow()
+    },
+    [id, applyJob, subscribeNow],
   )
 
   const onTargetFile = async (file: File) => {
@@ -154,20 +207,17 @@ export function EditorPage({ id }: { id: string }) {
         ...s,
         target: { ...s.target, imageAssetId: up.asset.id, imageWidth: img.naturalWidth, imageHeight: img.naturalHeight, mindAssetId: null, quality: null, featureCount: null },
       }))
-      await compileAndStore(img)
+      compileAndStore(img, up.asset.id)
     } catch (e) {
       setTargetError(e instanceof ApiError ? e.message : 'アップロードに失敗しました')
     }
   }
 
-  const retryCompile = async () => {
-    const url = scene?.target.imageAssetId ? detail?.assets[scene.target.imageAssetId]?.url : null
-    if (!url) return
-    try {
-      await compileAndStore(await loadImage(url))
-    } catch {
-      setCompile({ running: false, progress: 0, error: '画像を読み込めません' })
-    }
+  const retryCompile = () => {
+    const assetId = scene?.target.imageAssetId
+    const url = assetId ? detail?.assets[assetId]?.url : null
+    if (!assetId || !url) return
+    compileAndStore(url, assetId)
   }
 
   // ---- FR-4: オーバーレイ
@@ -453,10 +503,15 @@ export function EditorPage({ id }: { id: string }) {
                         再試行
                       </button>
                     </div>
-                  ) : scene.target.quality ? (
+                  ) : scene.target.quality && scene.target.mindAssetId ? (
                     <QualityBadge quality={scene.target.quality} featureCount={scene.target.featureCount} />
                   ) : (
-                    <p className="muted">解析待ち</p>
+                    <div>
+                      <p className="warn-text">画像の解析が完了していません。</p>
+                      <button className="btn small" onClick={retryCompile} data-testid="recompile">
+                        再解析
+                      </button>
+                    </div>
                   )}
                   <div className="field" style={{ marginTop: 12, maxWidth: 240 }}>
                     <label htmlFor="print-width">印刷したときの横幅（mm）</label>
@@ -821,6 +876,7 @@ function FileDrop({ accept, label, onFile, testId }: { accept: string; label: st
         type="file"
         accept={accept}
         className="sr-only"
+        aria-label={label}
         data-testid={testId}
         onChange={(e) => {
           const f = e.target.files?.[0]

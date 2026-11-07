@@ -1,7 +1,7 @@
 import request from 'supertest'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { emptyScene, type Scene } from '../../shared/src/index.ts'
-import { tinyGlb, tinyJpegHeader, tinyMind, tinyMp4, tinyPng } from './fixtures.ts'
+import { tinyGlb, tinyJpeg, tinyJpegHeader, tinyMind, tinyMp4, tinyPng } from './fixtures.ts'
 import { makeTestApp } from './helpers.ts'
 
 type App = ReturnType<typeof makeTestApp>
@@ -170,8 +170,11 @@ describe('素材（FR-3, FR-4, NFR-4, NFR-9）', () => {
     expect(mov.body.error).toContain('互換性優先')
     const txt = await upload(cookie, p.id, 'overlay', Buffer.from('hello world, this is not media'))
     expect(txt.status).toBe(400)
-    const jpgTarget = await upload(cookie, p.id, 'target_image', tinyJpegHeader())
+    const jpgTarget = await upload(cookie, p.id, 'target_image', tinyJpeg(640, 480))
     expect(jpgTarget.status).toBe(201)
+    expect(jpgTarget.body.asset.width).toBe(640)
+    const noSof = await upload(cookie, p.id, 'target_image', tinyJpegHeader())
+    expect(noSof.status).toBe(400)
     const glbTarget = await upload(cookie, p.id, 'target_image', tinyGlb())
     expect(glbTarget.status).toBe(400)
   })
@@ -182,8 +185,12 @@ describe('素材（FR-3, FR-4, NFR-4, NFR-9）', () => {
     const big = Buffer.concat([tinyPng(), Buffer.alloc(10 * 1024 * 1024 + 1)])
     const res = await upload(cookie, p.id, 'overlay', big)
     expect(res.status).toBe(413)
-    const edge = await upload(cookie, p.id, 'target_image', tinyPng(), { width: '9000', height: '100' })
+    // D-18: 寸法はサーバがヘッダから読む（申告値は信用しない）
+    const edge = await upload(cookie, p.id, 'target_image', tinyPng(9000, 100), { width: '1', height: '1' })
     expect(edge.status).toBe(400)
+    const ok = await upload(cookie, p.id, 'target_image', tinyPng(300, 200), { width: 'abc' })
+    expect(ok.status).toBe(201)
+    expect(ok.body.asset).toMatchObject({ width: 300, height: 200 })
   })
 
   it('公開中の素材は削除できない', async () => {
@@ -386,5 +393,130 @@ describe('QA 曖昧点の確定仕様（Q1, Q2, Q4）', () => {
     expect(t.db.prepare('SELECT COUNT(*) AS n FROM assets WHERE id = ?').get(old.body.asset.id)).toEqual({ n: 0 })
     // 参照中の素材は残る
     expect(t.db.prepare('SELECT COUNT(*) AS n FROM assets WHERE id = ?').get(scene.overlay!.assetId)).toEqual({ n: 1 })
+  })
+})
+
+describe('QA ラウンド 1 の修正（D-01〜D-22）', () => {
+  it('D-01: 公開 API は公開版が参照する素材のみ返す（下書き専用の素材を列挙しない）', async () => {
+    const cookie = await signup()
+    const p = await createProject(cookie)
+    const scene = await makeReady(cookie, p.id)
+    await request(t.app).post(`/api/projects/${p.id}/publish`).set('Cookie', cookie)
+    const draftOnly = await upload(cookie, p.id, 'overlay', tinyGlb())
+    await request(t.app)
+      .patch(`/api/projects/${p.id}`)
+      .set('Cookie', cookie)
+      .send({ draftScene: { ...scene, overlay: { ...scene.overlay!, type: 'model', assetId: draftOnly.body.asset.id } } })
+    const pub = await request(t.app).get(`/api/public/${p.slug}`)
+    expect(pub.status).toBe(200)
+    expect(Object.keys(pub.body.assets).sort()).toEqual([scene.target.imageAssetId, scene.target.mindAssetId, scene.overlay!.assetId].sort())
+    expect(pub.body.assets[draftOnly.body.asset.id]).toBeUndefined()
+    // プレビュー（token 保持者のみ）は下書きの素材を含む
+    const pv = await request(t.app).get(`/api/preview/${p.previewToken}`)
+    expect(pv.body.assets[draftOnly.body.asset.id]).toBeDefined()
+  })
+
+  it('D-02: buttonId は公開版のボタン ID のみ受理し、CSV は数式を無害化する', async () => {
+    const cookie = await signup()
+    const p = await createProject(cookie)
+    await makeReady(cookie, p.id)
+    const send = (body: object) => request(t.app).post(`/api/public/${p.slug}/events`).send(body)
+    // 未公開では cta_tap を受理しない
+    expect((await send({ type: 'cta_tap', buttonId: 'b1', os: 'ios' })).status).toBe(400)
+    await request(t.app).post(`/api/projects/${p.id}/publish`).set('Cookie', cookie)
+    expect((await send({ type: 'cta_tap', buttonId: '=cmd|"/c calc"!A1', os: 'ios' })).status).toBe(400)
+    expect((await send({ type: 'cta_tap', buttonId: 'bogus', os: 'ios' })).status).toBe(400)
+    expect((await send({ type: 'cta_tap', os: 'ios' })).status).toBe(400)
+    expect((await send({ type: 'cta_tap', buttonId: 'b1', os: 'ios' })).status).toBe(204)
+    // 万一 DB に危険な値があっても CSV セルは ' で無害化される
+    const today = new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10)
+    t.db.prepare("INSERT INTO analytics_events (project_id, scene_version_id, type, button_id, os, occurred_at, day_jst) VALUES (?, NULL, 'cta_tap', ?, 'ios', ?, ?)").run(
+      p.id,
+      '=HYPERLINK("x")',
+      new Date().toISOString(),
+      today,
+    )
+    const csv = await request(t.app).get(`/api/projects/${p.id}/stats.csv?from=${today}&to=${today}`).set('Cookie', cookie)
+    expect(csv.text).toContain(`"'=HYPERLINK(""x"")"`)
+    expect(csv.text).not.toMatch(/,"=/)
+  })
+
+  it('D-05: 応答が gzip 圧縮される（.mind と JSON）', async () => {
+    const cookie = await signup()
+    const p = await createProject(cookie)
+    const mind = await upload(cookie, p.id, 'target_mind', tinyMind(4000))
+    expect(mind.status).toBe(201)
+    const served = await request(t.app).get(mind.body.asset.url).set('Accept-Encoding', 'gzip')
+    expect(served.status).toBe(200)
+    expect(served.headers['content-encoding']).toBe('gzip')
+    const longScene = { ...emptyScene(), buttons: [1, 2, 3].map((i) => ({ id: `b${i}`, label: 'x', url: 'https://example.com/' + 'a'.repeat(900), preset: 'custom' })) }
+    await request(t.app).patch(`/api/projects/${p.id}`).set('Cookie', cookie).send({ draftScene: longScene })
+    const json = await request(t.app).get(`/api/projects/${p.id}`).set('Cookie', cookie).set('Accept-Encoding', 'gzip')
+    expect(json.headers['content-encoding']).toBe('gzip')
+    expect(json.body.draftScene.buttons).toHaveLength(3)
+    const plain = await request(t.app).get(mind.body.asset.url).set('Accept-Encoding', 'identity')
+    expect(plain.headers['content-encoding']).toBeUndefined()
+  })
+
+  it('D-06: アカウント合計の上限を超えると 413', async () => {
+    t.cleanup()
+    t = makeTestApp({ accountQuotaBytes: 1500 })
+    const cookie = await signup()
+    const p1 = await createProject(cookie)
+    const p2 = await createProject(cookie, '2 本目')
+    expect((await upload(cookie, p1.id, 'overlay', tinyPng())).status).toBe(201)
+    expect((await upload(cookie, p2.id, 'overlay', tinyPng())).status).toBe(201)
+    const over = await upload(cookie, p2.id, 'overlay', tinyMind(600) && tinyPng(), {})
+    const big = await upload(cookie, p2.id, 'overlay', Buffer.concat([tinyPng(), Buffer.alloc(1400)]))
+    expect(over.status === 201 || over.status === 413).toBe(true)
+    expect(big.status).toBe(413)
+    expect(big.body.error).toContain('アカウント全体')
+  })
+
+  it('D-07 / D-08: 検証エラーは日本語のみ、1 MB 超の本文は 413', async () => {
+    const cookie = await signup()
+    const p = await createProject(cookie)
+    const many = { ...emptyScene(), buttons: [1, 2, 3, 4].map((i) => ({ id: `b${i}`, label: 'x', url: 'https://example.com', preset: 'custom' })) }
+    const res = await request(t.app).patch(`/api/projects/${p.id}`).set('Cookie', cookie).send({ draftScene: many })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/^入力内容に誤りがあります（.*buttons.*）$/)
+    expect(res.body.error).not.toMatch(/Too big|expected/)
+    const huge = await request(t.app).patch(`/api/projects/${p.id}`).set('Cookie', cookie).set('Content-Type', 'application/json').send(JSON.stringify({ name: 'x'.repeat(1024 * 1024 + 10) }))
+    expect(huge.status).toBe(413)
+    expect(huge.body.error).toContain('大きすぎます')
+  })
+
+  it('D-15 / D-16: from > to は 400、存在しない slug は常に 404（レート制限より前）', async () => {
+    const cookie = await signup()
+    const p = await createProject(cookie)
+    const bad = await request(t.app).get(`/api/projects/${p.id}/stats?from=2026-11-10&to=2026-11-01`).set('Cookie', cookie)
+    expect(bad.status).toBe(400)
+    let last = 0
+    for (let i = 0; i < 65; i++) last = (await request(t.app).post('/api/public/nope9999/events').send({ type: 'page_open', os: 'other' })).status
+    expect(last).toBe(404)
+  })
+
+  it('D-17: MP4 以外の ISO-BMFF（HEIC / 3GP / M4A）は拒否', async () => {
+    const cookie = await signup()
+    const p = await createProject(cookie)
+    for (const brand of ['heic', 'mif1', '3gp5', 'M4A ']) expect((await upload(cookie, p.id, 'overlay', tinyMp4(brand))).status).toBe(400)
+    for (const brand of ['isom', 'mp42', 'avc1']) expect((await upload(cookie, p.id, 'overlay', tinyMp4(brand))).status).toBe(201)
+  })
+
+  it('D-21: ロック中でも 60 秒に 1 回は正しいパスワードで入れる', async () => {
+    await signup()
+    const login = (password: string) => request(t.app).post('/api/auth/login').send({ email: 'sato@example.com', password })
+    for (let i = 0; i < 10; i++) await login('wrong-password')
+    expect((await login('password123')).status).toBe(429)
+    const realNow = Date.now
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + 61_000)
+    try {
+      expect((await login('wrong-password')).status).toBe(401) // 1 回だけ照合される
+      expect((await login('password123')).status).toBe(429) // 直後はまたロック
+      spy.mockImplementation(() => realNow() + 122_000)
+      expect((await login('password123')).status).toBe(200)
+    } finally {
+      spy.mockRestore()
+    }
   })
 })

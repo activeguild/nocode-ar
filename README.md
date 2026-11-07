@@ -71,6 +71,19 @@ npm start          # http://localhost:3000 で API とビルド済みフロン�
 | `SUPPORT_EMAIL` | （なし） | ログイン画面に出すパスワード再設定の連絡先 |
 | `SERVICE_NAME` | ARチラシ（仮） | サービス名 |
 | `NODE_ENV=production` または `COOKIE_SECURE=1` | | セッション Cookie に `Secure` を付ける（HTTPS 配信時に設定） |
+| `TRUST_PROXY` | `loopback` | Express の `trust proxy`（`X-Forwarded-*` を信頼する範囲）。既定は同一ホストのプロキシのみ。CDN / 別ホストの LB 配下では `true` や IP 範囲を指定 |
+| `ACCOUNT_QUOTA_BYTES` | 2147483648（2 GB） | 1 アカウントの素材合計上限（NFR-4） |
+
+応答は Express の `compression` で gzip / brotli 圧縮されます（JS / CSS / JSON / HTML と、ターゲットデータ `.mind` を含む）。リバースプロキシ側の圧縮は必須ではありません。
+
+### Docker
+
+```bash
+docker build -t nocode-ar .
+docker run -p 3000:3000 -v nocode-ar-data:/data -e PUBLIC_ORIGIN=https://ar.example.com nocode-ar
+```
+
+`/data`（SQLite と素材）をボリュームにしてください。HTTPS はリバースプロキシ（Caddy / nginx 等）で終端し、`COOKIE_SECURE=1`（`NODE_ENV=production` で自動）と、プロキシが別ホストなら `TRUST_PROXY` を設定します。
 
 バックアップは `DATA_DIR` 配下（`app.db` と `assets/`）をコピーするだけです（NFR-5）。
 
@@ -111,6 +124,8 @@ DATA_DIR=/srv/nocode-ar/data npm run reset-password -- user@example.com
 
 ## 既知の制限（MVP）
 
+- ターゲット解析（`.mind` 生成）は作成者のブラウザで行い、画面を離れても続行して結果を下書きに保存します。タブを閉じた場合は中断されるため、戻ったときに「再解析」を押してください。
+- ログインロック（10 回失敗で 15 分）はアカウント単位です。ロック中でも 60 秒に 1 回は照合するため、正しいパスワードを知る本人は締め出されません。
 - 1 プロジェクト = ターゲット画像 1 枚 + オーバーレイ 1 つ（動画 / 画像 / 3D のいずれか）+ 行動ボタン 1〜3 個。
 - 動画は MP4（H.264）。MOV は拒否し案内を出す。MP4 コンテナの HEVC はサーバー側では判別できない（ブラウザで再生できない場合はアップロード時にエラーになる）。
 - 確認メール・パスワード再設定メールは送らない（上記コマンドで対応）。

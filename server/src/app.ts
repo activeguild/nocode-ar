@@ -1,3 +1,4 @@
+import compression from 'compression'
 import express, { type NextFunction, type Request, type Response } from 'express'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -84,6 +85,7 @@ function makeRateLimiter(limit: number, windowMs: number) {
   const buckets = new Map<string, { start: number; count: number }>()
   return (key: string): boolean => {
     const now = Date.now()
+    if (buckets.size > 5000) for (const [k, v] of buckets) if (now - v.start > windowMs) buckets.delete(k) // D-16
     const b = buckets.get(key)
     if (!b || now - b.start > windowMs) {
       buckets.set(key, { start: now, count: 1 })
@@ -97,7 +99,14 @@ function makeRateLimiter(limit: number, windowMs: number) {
 export function createApp({ db, config }: AppDeps) {
   const app = express()
   app.disable('x-powered-by')
-  app.set('trust proxy', true)
+  app.set('trust proxy', config.trustProxy)
+  // D-05: gzip / brotli 圧縮。既定の filter（圧縮可能な Content-Type）に加え、ターゲットデータ（.mind, octet-stream）も対象にする
+  app.use(
+    compression({
+      threshold: 1024,
+      filter: (req, res) => req.path.endsWith('.mind') || compression.filter(req, res),
+    }),
+  )
   app.use(express.json({ limit: '1mb' }))
   app.use(attachUser(db))
   app.use('/api', checkOrigin)
@@ -211,7 +220,8 @@ export function createApp({ db, config }: AppDeps) {
     wrap((req, res) => {
       const p = ownProject(req)
       const body = z.object({ name: nameSchema.optional(), draftScene: sceneSchema.optional() }).safeParse(req.body)
-      if (!body.success) throw new HttpError(400, '入力内容に誤りがあります: ' + body.error.issues.map((i) => i.path.join('.') + ' ' + i.message).join('; '))
+      // D-07: zod の英語メッセージは出さず、項目名のみ日本語で示す
+      if (!body.success) throw new HttpError(400, '入力内容に誤りがあります（' + [...new Set(body.error.issues.map((i) => i.path.join('.') || 'body'))].join(', ') + '）')
       if (body.data.draftScene) {
         // 参照アセットがこのプロジェクトのものか検証
         const s = body.data.draftScene
@@ -244,13 +254,20 @@ export function createApp({ db, config }: AppDeps) {
       const kind = String(req.body?.kind ?? '') as AssetKind
       if (!ASSET_KINDS.includes(kind)) throw new HttpError(400, 'kind が不正です')
       if (!req.file) throw new HttpError(400, 'ファイルがありません')
-      const num = (v: unknown) => (v === undefined || v === '' ? null : Number(v))
-      const width = num(req.body.width)
-      const height = num(req.body.height)
-      if (kind === 'target_image' && width && height && Math.max(width, height) > LIMITS.targetImageMaxEdgePx) {
-        throw new HttpError(400, '長辺 8,000 px 以下の画像にしてください')
+      const num = (v: unknown) => {
+        const n = v === undefined || v === '' ? NaN : Number(v)
+        return Number.isFinite(n) && n > 0 ? n : null
       }
-      const a = saveAsset(db, config.dataDir, { projectId: p.id, kind, buffer: req.file.buffer, width, height, durationSec: num(req.body.durationSec) })
+      const a = saveAsset(db, config.dataDir, {
+        projectId: p.id,
+        userId: req.user!.id,
+        accountQuotaBytes: config.accountQuotaBytes,
+        kind,
+        buffer: req.file.buffer,
+        width: num(req.body.width),
+        height: num(req.body.height),
+        durationSec: num(req.body.durationSec),
+      })
       res.status(201).json({ asset: toAssetInfo(a) })
     }),
   )
@@ -354,6 +371,7 @@ export function createApp({ db, config }: AppDeps) {
   const statsRange = (req: Request) => {
     const q = z.object({ from: daySchema, to: daySchema }).safeParse(req.query)
     if (!q.success) throw new HttpError(400, 'from / to は YYYY-MM-DD で指定してください')
+    if (q.data.from > q.data.to) throw new HttpError(400, '開始日は終了日以前にしてください') // D-15
     return q.data
   }
   app.get(
@@ -372,7 +390,12 @@ export function createApp({ db, config }: AppDeps) {
       const p = ownProject(req)
       const { from, to } = statsRange(req)
       const rows = queryStats(db, p.id, from, to)
-      const esc = (v: unknown) => `"${String(v ?? '').replace(/"/g, '""')}"`
+      // D-02: 数式インジェクション対策。= + - @ タブ CR で始まるセルは ' を前置する
+      const esc = (v: unknown) => {
+        let t = String(v ?? '')
+        if (/^[=+\-@\t\r]/.test(t)) t = "'" + t
+        return `"${t.replace(/"/g, '""')}"`
+      }
       const csv = ['﻿日付,種別,ボタンID,OS,回数', ...rows.map((r) => [r.day, r.type, r.buttonId, r.os, r.count].map(esc).join(','))].join('\r\n')
       res.setHeader('Content-Type', 'text/csv; charset=utf-8')
       res.setHeader('Content-Disposition', `attachment; filename="stats-${p.slug}-${from}-${to}.csv"`)
@@ -415,7 +438,10 @@ export function createApp({ db, config }: AppDeps) {
       return
     }
     const scene = parseScene(v.scene)
-    res.json({ name: p.name, slug: p.slug, scene, sceneVersionId: v.id, assets: assetMap(db, p.id), preview: false })
+    // D-01: 公開版が参照する素材のみ返す（下書き専用の未公開素材を列挙しない）
+    const refs = publishedAssetIds(db, p)
+    const assets = Object.fromEntries(Object.entries(assetMap(db, p.id)).filter(([id]) => refs.has(id)))
+    res.json({ name: p.name, slug: p.slug, scene, sceneVersionId: v.id, assets, preview: false })
   })
 
   app.get('/api/preview/:token', (req, res) => {
@@ -432,15 +458,23 @@ export function createApp({ db, config }: AppDeps) {
     '/api/public/:slug/events',
     wrap((req, res) => {
       const slug = String(req.params.slug)
-      if (!eventLimiter(slug)) throw new HttpError(429, 'too many requests')
       const p = getProjectBySlug(db, slug)
-      if (!p) throw new HttpError(404, 'not found')
+      if (!p) throw new HttpError(404, 'not found') // D-16: 存在しない slug ではバケットを作らない
+      if (!eventLimiter(slug)) throw new HttpError(429, 'too many requests')
       const body = analyticsEventSchema.safeParse(req.body)
       if (!body.success) throw new HttpError(400, 'invalid event')
+      // D-02: buttonId は公開版のボタン ID と照合する（未認証入力をそのまま保存しない）
+      let buttonId: string | null = null
+      if (body.data.type === 'cta_tap') {
+        const v = p.status === 'published' && p.published_scene_id ? getSceneVersion(db, p.published_scene_id) : null
+        const ids = v ? parseScene(v.scene).buttons.map((b) => b.id) : []
+        if (!body.data.buttonId || !ids.includes(body.data.buttonId)) throw new HttpError(400, 'invalid buttonId')
+        buttonId = body.data.buttonId
+      }
       const now = new Date()
       db.prepare(
         'INSERT INTO analytics_events (project_id, scene_version_id, type, button_id, os, occurred_at, day_jst) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      ).run(p.id, p.status === 'published' ? p.published_scene_id : null, body.data.type, body.data.type === 'cta_tap' ? (body.data.buttonId ?? null) : null, body.data.os, now.toISOString(), toDayJst(now))
+      ).run(p.id, p.status === 'published' ? p.published_scene_id : null, body.data.type, buttonId, body.data.os, now.toISOString(), toDayJst(now))
       res.status(204).end()
     }),
   )
@@ -496,6 +530,10 @@ export function createApp({ db, config }: AppDeps) {
     }
     if (err instanceof SyntaxError && 'body' in (err as object)) {
       res.status(400).json({ error: 'JSON の形式が不正です' })
+      return
+    }
+    if ((err as { type?: string }).type === 'entity.too.large') {
+      res.status(413).json({ error: '送信データが大きすぎます（1 MB まで）' }) // D-08
       return
     }
     console.error(JSON.stringify({ level: 'error', time: nowIso(), message: (err as Error).message, stack: (err as Error).stack }))

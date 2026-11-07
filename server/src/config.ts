@@ -14,6 +14,10 @@ export interface Config {
   supportEmail: string | null
   serviceName: string
   cookieSecure: boolean
+  /** Express の trust proxy 設定（D-22）。既定は 'loopback'（同一ホストのリバースプロキシ / Vite 開発サーバのみ信頼） */
+  trustProxy: string | boolean
+  /** 1 アカウントの素材合計上限（D-06 / NFR-4）。既定 2 GB */
+  accountQuotaBytes: number
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -25,5 +29,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     supportEmail: env.SUPPORT_EMAIL || null,
     serviceName: env.SERVICE_NAME || 'ARチラシ（仮）',
     cookieSecure: env.COOKIE_SECURE === '1' || env.NODE_ENV === 'production',
+    trustProxy: env.TRUST_PROXY === undefined ? 'loopback' : env.TRUST_PROXY === 'true' ? true : env.TRUST_PROXY === 'false' ? false : env.TRUST_PROXY,
+    accountQuotaBytes: Number(env.ACCOUNT_QUOTA_BYTES ?? 2 * 1024 * 1024 * 1024),
   }
 }

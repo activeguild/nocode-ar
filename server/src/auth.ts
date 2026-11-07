@@ -47,21 +47,39 @@ declare module 'express-serve-static-core' {
   }
 }
 
-/** FR-1-2: 連続失敗 10 回で 15 分ロック（プロセス内メモリ） */
-const failures = new Map<string, { count: number; lockedUntil: number }>()
+/**
+ * FR-1-2: 連続失敗 10 回で 15 分ロック（プロセス内メモリ、アカウント単位）。
+ * D-21: ロック中も 60 秒に 1 回だけ照合を許可する（正しいパスワードを知る本人は締め出されず、総当たりは 1 回/分に制限）。
+ * D-16: エントリ数の上限を設け、古いものから捨てる。
+ */
+const failures = new Map<string, { count: number; lockedUntil: number; lastAttempt: number }>()
+const LOCK_SLOW_INTERVAL_MS = 60_000
+const MAX_TRACKED = 10_000
 
 export function isLocked(email: string): boolean {
   const f = failures.get(email)
-  return !!f && f.lockedUntil > Date.now()
+  if (!f || f.lockedUntil <= Date.now()) return false
+  if (Date.now() - f.lastAttempt >= LOCK_SLOW_INTERVAL_MS) {
+    f.lastAttempt = Date.now()
+    return false
+  }
+  return true
 }
 export function recordFailure(email: string) {
-  const f = failures.get(email) ?? { count: 0, lockedUntil: 0 }
+  const f = failures.get(email) ?? { count: 0, lockedUntil: 0, lastAttempt: 0 }
   f.count += 1
+  f.lastAttempt = Date.now()
   if (f.count >= LOCK_MAX_FAILS) {
     f.lockedUntil = Date.now() + LOCK_MINUTES * 60_000
     f.count = 0
   }
   failures.set(email, f)
+  if (failures.size > MAX_TRACKED) {
+    for (const k of failures.keys()) {
+      failures.delete(k)
+      if (failures.size <= MAX_TRACKED / 2) break
+    }
+  }
 }
 export function clearFailures(email: string) {
   failures.delete(email)

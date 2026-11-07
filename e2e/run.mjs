@@ -117,6 +117,31 @@ try {
     assert(q === 'good' || q === 'fair', `チラシ風画像は 良い/普通 になる（実際: ${q}）`)
   })
 
+  await step('D-04 解析中に画面を離れても結果が失われない（別画像で再解析 → 一覧へ遷移 → 戻る）', async () => {
+    await page.setInputFiles('[data-testid=target-file]', path.join(FIX, 'target.png'))
+    await page.waitForSelector('[role=progressbar]', { timeout: 30_000 })
+    await page.click('.app-header .brand') // SPA 遷移（解析中）
+    await page.waitForURL('**/projects')
+    await page.waitForTimeout(12_000)
+    await page.goto(`${BASE}/projects/${projectId}`)
+    await page.waitForSelector('[data-testid=quality]', { timeout: 120_000 })
+    const detail = await (await context.request.get(`${BASE}/api/projects/${projectId}`)).json()
+    assert(detail.draftScene.target.mindAssetId, 'サーバの下書きに mindAssetId が保存されている')
+    assert(detail.draftScene.target.quality === 'good', `quality=${detail.draftScene.target.quality}`)
+  })
+
+  await step('D-04 「解析待ち」状態に再解析ボタンが出て復旧できる', async () => {
+    const detail = await (await context.request.get(`${BASE}/api/projects/${projectId}`)).json()
+    const broken = { ...detail.draftScene, target: { ...detail.draftScene.target, mindAssetId: null, quality: null, featureCount: null } }
+    const r = await context.request.patch(`${BASE}/api/projects/${projectId}`, { data: { draftScene: broken } })
+    assert(r.ok(), 'PATCH')
+    await page.goto(`${BASE}/projects/${projectId}`)
+    await page.waitForSelector('[data-testid=recompile]')
+    await page.click('[data-testid=recompile]')
+    await page.waitForSelector('[data-testid=quality]', { timeout: 120_000 })
+    await page.waitForFunction(() => document.querySelector('[data-testid=save-status]')?.dataset.state === 'saved', null, { timeout: 15_000 })
+  })
+
   await step('AC-M2 オーバーレイ画像の登録と配置（数値で幅を変更）', async () => {
     await page.setInputFiles('[data-testid=overlay-file]', path.join(FIX, 'overlay.png'))
     await page.waitForSelector('[data-testid=placement]')
@@ -127,6 +152,17 @@ try {
     await page.mouse.down()
     await page.mouse.move(box.x + box.width / 2 + 40, box.y + box.height / 2 + 30, { steps: 5 })
     await page.mouse.up()
+  })
+
+  await step('D-04 変更の 2 秒以内に画面遷移しても保存される', async () => {
+    await page.fill('[data-testid=overlay-width]', '33')
+    await page.click('.app-header .brand')
+    await page.waitForURL('**/projects')
+    await page.waitForTimeout(800)
+    const detail = await (await context.request.get(`${BASE}/api/projects/${projectId}`)).json()
+    assert(Math.abs(detail.draftScene.overlay.transform.width - 0.33) < 0.001, `width=${detail.draftScene.overlay.transform.width}`)
+    await page.goto(`${BASE}/projects/${projectId}`)
+    await page.waitForSelector('[data-testid=placement]')
   })
 
   await step('AC-M2 3D モデル（GLB）の読み込みと 3D プレビュー', async () => {
@@ -237,6 +273,21 @@ try {
     const res = await context.request.get(`${BASE}/api/projects/${projectId}/stats?from=2000-01-01&to=2100-01-01`)
     const rows = (await res.json()).rows
     assert(rows.some((r) => r.type === 'blocked' && r.os === 'ios'), 'blocked が iOS で記録される')
+  })
+
+  await step('D-03 カメラ許可を拒否すると「カメラの許可が必要です」と設定手順が出る', async () => {
+    const denied = await newContext({ viewport: { width: 390, height: 844 } })
+    await denied.addInitScript(() => {
+      navigator.mediaDevices.getUserMedia = () => Promise.reject(new DOMException('Permission denied', 'NotAllowedError'))
+    })
+    const p = await denied.newPage()
+    await p.goto(publicUrl.replace(/^https?:\/\/[^/]+/, BASE))
+    await p.click('[data-testid=start-camera]')
+    await p.waitForSelector('text=カメラの許可が必要です', { timeout: 30_000 })
+    const hint = await p.locator('.screen .muted').textContent()
+    assert(hint.includes('iPhone') && hint.includes('Android'), '設定手順')
+    await p.screenshot({ path: path.join(OUT, 'viewer-camera-denied.png') })
+    await denied.close()
   })
 
   await step('AC-M6 差し替え: 同じ URL で新しい内容になる', async () => {

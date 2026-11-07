@@ -7,7 +7,7 @@ import { resetLockState } from '../src/auth.ts'
 import { openDb } from '../src/db.ts'
 import type { Config } from '../src/config.ts'
 
-export function makeTestApp() {
+export function makeTestApp(overrides: Partial<Config> = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nocode-ar-test-'))
   const config: Config = {
     port: 0,
@@ -17,6 +17,9 @@ export function makeTestApp() {
     supportEmail: null,
     serviceName: 'テスト',
     cookieSecure: false,
+    trustProxy: 'loopback',
+    accountQuotaBytes: 2 * 1024 * 1024 * 1024,
+    ...overrides,
   }
   const db = openDb(':memory:')
   resetLockState()
