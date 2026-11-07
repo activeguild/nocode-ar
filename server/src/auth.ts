@@ -132,9 +132,9 @@ export function checkOrigin(req: Request, res: Response, next: NextFunction) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next()
   const origin = req.headers.origin
   if (!origin) return next() // ブラウザ以外（テスト・curl）
-  const host = req.headers.host
+  const hosts = [req.headers.host, req.headers['x-forwarded-host']].flat().filter(Boolean).map((h) => String(h).split(',')[0].trim())
   try {
-    if (new URL(origin).host === host) return next()
+    if (hosts.includes(new URL(origin).host)) return next()
   } catch {
     /* fallthrough */
   }

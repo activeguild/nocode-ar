@@ -212,3 +212,23 @@ WebAR の技術選定は、ライブラリより先に **iOS と Android のブ�
 - [S24] Apple WWDC25「HTML model element（visionOS 26 Safari）」: https://developer.apple.com/videos/play/wwdc2025/237
 
 > 注: 本セッションのネットワーク制限により modelviewer.dev、developers.google.com、8thwall.org、webkit.org、caniuse.com 等は直接取得できなかった。これらの出典は検索結果の抜粋および GitHub 上の一次ファイルで裏取りしている。要件定義フェーズで必要に応じて再確認する。
+
+---
+
+## 採用アーキテクチャ（実装版、2026-11-07）
+
+技術調査 §5 の推奨構成をそのまま採用した。実装の詳細は README とソースを参照。
+
+| 層 | 実装 |
+| --- | --- |
+| フロントエンド | `web/`: Vite 8 + React 19 + TypeScript。`index.html`（作成画面 SPA: ログイン / 一覧 / 編集 / 計測）と `viewer.html`（閲覧ページ）の 2 エントリ。three.js 0.183（model-viewer と同系。MVP では model-viewer は未使用） |
+| 画像トラッキング | `mind-ar` 1.2.5。`web/vite.config.ts` の `mindArThreeCompat` プラグインで、mind-ar 配下からの `three` import を `web/src/three-compat-shim.ts`（`sRGBEncoding` を補う）に向ける。`optimizeDeps.exclude` で事前バンドルを回避。ターゲットデータ（`.mind`）は作成者のブラウザ内で `Compiler` により生成（`web/src/editor/compile.ts`） |
+| オーバーレイ描画 | `web/src/ar/overlay.ts`（動画 = VideoTexture、画像 = TextureLoader、3D = GLTFLoader）。閲覧ページ（MindAR アンカー配下）と作成画面の 3D プレビューで共通 |
+| バックエンド | `server/`: Node 22 + Express 5 + better-sqlite3（WAL）+ multer（メモリ → `data/assets/<projectId>/`）+ qrcode。セッション Cookie（scrypt ハッシュ、Origin 検査）。ビルド済み `web/dist` も配信 |
+| 共有 | `shared/src/scene.ts`: シーン定義の zod スキーマ・上限値・URL 許可ルール・品質しきい値 |
+| 依存の手当て | `mind-ar` の `canvas`（ネイティブ）はルート `package.json` の `overrides` で空パッケージに置換 |
+| テスト | Vitest + supertest（API 32 件）、Playwright（E2E 20 ステップ。Chromium のフェイクカメラに合成ターゲット映像 `.y4m` を流し、`.mind` 生成 → 認識 → 計測まで自動検証。SwiftShader 向けに `failIfMajorPerformanceCaveat` を無効化する初期化スクリプトをテスト側で注入） |
+
+実測（ビルド、gzip）: viewer 4.3 KB + 共通チャンク 166 KB + three 82 KB = 約 254 KB（導入画面まで）、カメラ起動時に MindAR 48 KB + TF.js 含む controller 290 KB = 約 338 KB を追加読み込み。ターゲット画像の `.mind` 生成はヘッドレス Chromium（ソフトウェア描画）で 512×640 画像が約 6 秒。
+
+将来の置き換え: SQLite → PostgreSQL（`server/src/projects.ts` の SQL を差し替え）、ローカル素材 → S3 / R2（`server/src/assets.ts` の保存・`/a/:name` 配信を差し替え）、MindAR → フォーク版（`web/src/viewer/ar.ts` と `compile.ts` のみが依存）。
