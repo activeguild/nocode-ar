@@ -14,7 +14,8 @@
     "typecheck": "npm run typecheck -w server && npm run typecheck -w web",
     "test": "npm run test -w server",
     "e2e": "node scripts/e2e.mjs",
-    "fixtures": "node scripts/gen-fixtures.mjs"
+    "fixtures": "node scripts/gen-fixtures.mjs",
+    "reset-password": "npm run reset-password -w server --"
   },
   "overrides": {
     "canvas": "npm:empty-npm-package@1.0.0"

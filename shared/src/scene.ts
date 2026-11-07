@@ -132,12 +132,13 @@ export const analyticsEventSchema = z.object({
   os: z.enum(OS_KINDS).default('other'),
 })
 
-export type ProjectStatus = 'draft' | 'published' | 'unpublished'
+export type ProjectStatus = 'draft' | 'published' | 'unpublished' | 'deleted'
 
 export const PROJECT_STATUS_LABEL: Record<ProjectStatus, string> = {
   draft: '下書き',
   published: '公開中',
   unpublished: '停止中',
+  deleted: '削除済み',
 }
 
 /** 公開 API が返す非公開理由 */

@@ -336,3 +336,55 @@ describe('健全性', () => {
     expect(res.status).toBe(403)
   })
 })
+
+describe('QA 曖昧点の確定仕様（Q1, Q2, Q4）', () => {
+  it('Q1: 削除後は「終了しました」（410）で、最後の公開版のボタンを返す', async () => {
+    const cookie = await signup()
+    const p = await createProject(cookie)
+    await makeReady(cookie, p.id)
+    await request(t.app).post(`/api/projects/${p.id}/publish`).set('Cookie', cookie)
+    const del = await request(t.app).delete(`/api/projects/${p.id}`).set('Cookie', cookie)
+    expect(del.status).toBe(204)
+    const pub = await request(t.app).get(`/api/public/${p.slug}`)
+    expect(pub.status).toBe(410)
+    expect(pub.body.buttons[0].label).toBe('資料を請求する')
+    expect((await request(t.app).get(`/api/projects/${p.id}`).set('Cookie', cookie)).status).toBe(404)
+    expect((await request(t.app).get(`/api/preview/${p.previewToken}`)).status).toBe(404)
+    // 素材ファイルは削除される
+    expect(t.db.prepare('SELECT COUNT(*) AS n FROM assets WHERE project_id = ?').get(p.id)).toEqual({ n: 0 })
+  })
+
+  it('Q2: 再開は停止前の公開版に戻し、下書きは反映しない（type = resume）', async () => {
+    const cookie = await signup()
+    const p = await createProject(cookie)
+    const scene = await makeReady(cookie, p.id)
+    await request(t.app).post(`/api/projects/${p.id}/publish`).set('Cookie', cookie)
+    await request(t.app).post(`/api/projects/${p.id}/unpublish`).set('Cookie', cookie)
+    const edited = { ...scene, buttons: [{ id: 'b1', label: '変更後', url: 'https://example.com/new', preset: 'custom' as const }] }
+    await request(t.app).patch(`/api/projects/${p.id}`).set('Cookie', cookie).send({ draftScene: edited })
+    const badResume = await request(t.app).post(`/api/projects/${p.id}/resume`).set('Cookie', cookie)
+    expect(badResume.status).toBe(200)
+    expect(badResume.body.project.status).toBe('published')
+    expect(badResume.body.publishEvents.map((e: { type: string }) => e.type)).toEqual(['publish', 'unpublish', 'resume'])
+    const pub = await request(t.app).get(`/api/public/${p.slug}`)
+    expect(pub.body.scene.buttons[0].label).toBe('資料を請求する')
+    expect((await request(t.app).post(`/api/projects/${p.id}/resume`).set('Cookie', cookie)).status).toBe(400)
+  })
+
+  it('Q4: 下書きにも公開版にも参照されない古い素材は自動削除される', async () => {
+    const cookie = await signup()
+    const p = await createProject(cookie)
+    const scene = await makeReady(cookie, p.id)
+    const old = await upload(cookie, p.id, 'overlay', tinyGlb())
+    expect(old.status).toBe(201)
+    // 猶予時間（15 分）内は削除されない
+    await request(t.app).patch(`/api/projects/${p.id}`).set('Cookie', cookie).send({ draftScene: scene })
+    expect(t.db.prepare('SELECT COUNT(*) AS n FROM assets WHERE id = ?').get(old.body.asset.id)).toEqual({ n: 1 })
+    // 古い素材として扱わせる
+    t.db.prepare('UPDATE assets SET created_at = ? WHERE id = ?').run('2000-01-01T00:00:00.000Z', old.body.asset.id)
+    await request(t.app).patch(`/api/projects/${p.id}`).set('Cookie', cookie).send({ draftScene: scene })
+    expect(t.db.prepare('SELECT COUNT(*) AS n FROM assets WHERE id = ?').get(old.body.asset.id)).toEqual({ n: 0 })
+    // 参照中の素材は残る
+    expect(t.db.prepare('SELECT COUNT(*) AS n FROM assets WHERE id = ?').get(scene.overlay!.assetId)).toEqual({ n: 1 })
+  })
+})

@@ -55,11 +55,11 @@ export function parseScene(json: string): Scene {
 }
 
 export function listProjects(db: Db, userId: string): ProjectRow[] {
-  return db.prepare('SELECT * FROM projects WHERE user_id = ? ORDER BY updated_at DESC').all(userId) as ProjectRow[]
+  return db.prepare("SELECT * FROM projects WHERE user_id = ? AND status <> 'deleted' ORDER BY updated_at DESC").all(userId) as ProjectRow[]
 }
 
 export function getProject(db: Db, userId: string, id: string): ProjectRow | null {
-  return (db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(id, userId) as ProjectRow | undefined) ?? null
+  return (db.prepare("SELECT * FROM projects WHERE id = ? AND user_id = ? AND status <> 'deleted'").get(id, userId) as ProjectRow | undefined) ?? null
 }
 
 export function getProjectBySlug(db: Db, slug: string): ProjectRow | null {
@@ -112,9 +112,45 @@ export function updateProject(db: Db, id: string, patch: { name?: string; draftS
   db.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = @id`).run(params)
 }
 
+/**
+ * Q1: 削除は論理削除。slug と公開履歴（終了画面のボタン・案内 URL に使う）は残し、素材ファイルは削除する。
+ * 削除後に公開 URL を開くと「終了しました」画面（R1 の案内つき）になる。
+ */
 export function deleteProject(db: Db, dataDir: string, p: ProjectRow) {
   for (const a of listAssets(db, p.id)) deleteAssetFile(dataDir, a)
-  db.prepare('DELETE FROM projects WHERE id = ?').run(p.id)
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM assets WHERE project_id = ?').run(p.id)
+    db.prepare("UPDATE projects SET status = 'deleted', draft_scene = ?, preview_token = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify(emptyScene()),
+      newToken(),
+      nowIso(),
+      p.id,
+    )
+    db.prepare('INSERT INTO publish_events (project_id, type, scene_version_id, at) VALUES (?, ?, ?, ?)').run(p.id, 'delete', p.published_scene_id, nowIso())
+  })
+  tx()
+}
+
+/**
+ * Q4: 下書きにも公開版にも参照されていない素材を削除する（差し替え前の旧素材の自動整理）。
+ * アップロード直後〜下書き保存までの競合を避けるため、作成から GRACE 以内の素材は対象外。
+ */
+const CLEANUP_GRACE_MS = 15 * 60_000
+export function cleanupUnreferencedAssets(db: Db, dataDir: string, p: ProjectRow): number {
+  const keep = publishedAssetIds(db, p)
+  const d = parseScene(p.draft_scene)
+  for (const id of [d.target.imageAssetId, d.target.mindAssetId, d.overlay?.assetId, d.overlay?.thumbnailAssetId]) if (id) keep.add(id)
+  let n = 0
+  const cutoff = new Date(Date.now() - CLEANUP_GRACE_MS).toISOString()
+  for (const a of listAssets(db, p.id)) {
+    if (keep.has(a.id)) continue
+    const createdAt = (db.prepare('SELECT created_at FROM assets WHERE id = ?').get(a.id) as { created_at: string }).created_at
+    if (createdAt > cutoff) continue
+    db.prepare('DELETE FROM assets WHERE id = ?').run(a.id)
+    deleteAssetFile(dataDir, a)
+    n++
+  }
+  return n
 }
 
 export function rotatePreviewToken(db: Db, id: string): string {
@@ -137,6 +173,7 @@ export function getSceneVersion(db: Db, id: string): SceneVersionRow | null {
 
 /** FR-6-3 / FR-6-7: 下書きのスナップショットを公開版にする。NFR-5: 10 世代保持 */
 export function publishProject(db: Db, p: ProjectRow, userId: string): SceneVersionRow {
+  // 停止中からの「公開」は下書きの再公開（republish）。停止前の公開版に戻すだけなら resumeProject
   const now = nowIso()
   const version: SceneVersionRow = { id: newId(), project_id: p.id, scene: p.draft_scene, published_at: now, published_by_user_id: userId }
   const tx = db.transaction(() => {
@@ -159,6 +196,16 @@ export function publishProject(db: Db, p: ProjectRow, userId: string): SceneVers
   return version
 }
 
+/** Q2: 再開は停止前の公開版にそのまま戻す（下書きは反映しない）。PublishEvent.type = 'resume' */
+export function resumeProject(db: Db, p: ProjectRow) {
+  const now = nowIso()
+  const tx = db.transaction(() => {
+    db.prepare("UPDATE projects SET status = 'published', updated_at = ? WHERE id = ?").run(now, p.id)
+    db.prepare('INSERT INTO publish_events (project_id, type, scene_version_id, at) VALUES (?, ?, ?, ?)').run(p.id, 'resume', p.published_scene_id, now)
+  })
+  tx()
+}
+
 export function unpublishProject(db: Db, p: ProjectRow) {
   const now = nowIso()
   const tx = db.transaction(() => {
@@ -168,8 +215,9 @@ export function unpublishProject(db: Db, p: ProjectRow) {
   tx()
 }
 
+export type PublishEventType = 'publish' | 'republish' | 'unpublish' | 'resume' | 'delete'
 export interface PublishEventRow {
-  type: 'publish' | 'republish' | 'unpublish'
+  type: PublishEventType
   scene_version_id: string | null
   at: string
 }

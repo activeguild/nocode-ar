@@ -33,6 +33,7 @@ import type { Db } from './db.ts'
 import { nowIso } from './db.ts'
 import {
   assetMap,
+  cleanupUnreferencedAssets,
   createProject,
   deleteProject,
   getProject,
@@ -45,6 +46,7 @@ import {
   publishProject,
   publishedAssetIds,
   queryStats,
+  resumeProject,
   rotatePreviewToken,
   toSummary,
   unpublishProject,
@@ -218,6 +220,7 @@ export function createApp({ db, config }: AppDeps) {
         }
       }
       updateProject(db, p.id, body.data)
+      if (body.data.draftScene) cleanupUnreferencedAssets(db, config.dataDir, ownProject(req))
       res.json(projectDetail(req, ownProject(req)))
     }),
   )
@@ -275,6 +278,7 @@ export function createApp({ db, config }: AppDeps) {
       const blockers = publishBlockers(parseScene(p.draft_scene))
       if (blockers.length) throw new HttpError(400, blockers.join('。'))
       publishProject(db, p, req.user!.id)
+      cleanupUnreferencedAssets(db, config.dataDir, ownProject(req))
       res.json(projectDetail(req, ownProject(req)))
     }),
   )
@@ -286,6 +290,17 @@ export function createApp({ db, config }: AppDeps) {
       const p = ownProject(req)
       if (p.status !== 'published') throw new HttpError(400, '公開中ではありません')
       unpublishProject(db, p)
+      res.json(projectDetail(req, ownProject(req)))
+    }),
+  )
+
+  app.post(
+    '/api/projects/:id/resume',
+    requireAuth,
+    wrap((req, res) => {
+      const p = ownProject(req)
+      if (p.status !== 'unpublished' || !p.published_scene_id) throw new HttpError(400, '停止中の AR のみ再開できます')
+      resumeProject(db, p)
       res.json(projectDetail(req, ownProject(req)))
     }),
   )
@@ -383,6 +398,13 @@ export function createApp({ db, config }: AppDeps) {
       res.status(404).json({ reason: 'not_found' })
       return
     }
+    if (p.status === 'deleted' || p.status === 'unpublished') {
+      // R1 / Q1: 停止・削除後の「終了しました」画面にも、最後の公開版の行動ボタンと案内 URL を残す
+      const v = p.published_scene_id ? getSceneVersion(db, p.published_scene_id) : null
+      const scene = v ? parseScene(v.scene) : null
+      res.status(410).json({ reason: 'unpublished', name: p.name, buttons: scene?.buttons ?? [], endedUrl: scene?.endedUrl ?? '' })
+      return
+    }
     if (p.status === 'draft' || !p.published_scene_id) {
       res.status(404).json({ reason: 'draft', name: p.name })
       return
@@ -393,18 +415,13 @@ export function createApp({ db, config }: AppDeps) {
       return
     }
     const scene = parseScene(v.scene)
-    if (p.status === 'unpublished') {
-      // R1: 終了画面にも行動ボタン・案内 URL を残す
-      res.status(410).json({ reason: 'unpublished', name: p.name, buttons: scene.buttons, endedUrl: scene.endedUrl })
-      return
-    }
     res.json({ name: p.name, slug: p.slug, scene, sceneVersionId: v.id, assets: assetMap(db, p.id), preview: false })
   })
 
   app.get('/api/preview/:token', (req, res) => {
     res.setHeader('Cache-Control', 'no-store')
     const p = getProjectByPreviewToken(db, String(req.params.token))
-    if (!p) {
+    if (!p || p.status === 'deleted') {
       res.status(404).json({ reason: 'not_found' })
       return
     }
@@ -423,7 +440,7 @@ export function createApp({ db, config }: AppDeps) {
       const now = new Date()
       db.prepare(
         'INSERT INTO analytics_events (project_id, scene_version_id, type, button_id, os, occurred_at, day_jst) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      ).run(p.id, p.published_scene_id, body.data.type, body.data.type === 'cta_tap' ? (body.data.buttonId ?? null) : null, body.data.os, now.toISOString(), toDayJst(now))
+      ).run(p.id, p.status === 'published' ? p.published_scene_id : null, body.data.type, body.data.type === 'cta_tap' ? (body.data.buttonId ?? null) : null, body.data.os, now.toISOString(), toDayJst(now))
       res.status(204).end()
     }),
   )
