@@ -1,0 +1,25 @@
+{
+  "name": "nocode-ar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ノーコード WebAR サービス MVP（印刷物にかざす AR をブラウザだけで作成・公開）",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "npm run build -w web && npm run build -w server",
+    "start": "node server/dist/server/src/index.js",
+    "typecheck": "npm run typecheck -w server && npm run typecheck -w web",
+    "test": "npm run test -w server",
+    "e2e": "node scripts/e2e.mjs",
+    "fixtures": "node scripts/gen-fixtures.mjs"
+  },
+  "overrides": {
+    "canvas": "npm:empty-npm-package@1.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "@nocode-ar/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "server と web が共有するシーン定義の型・検証（ソースのまま参照する。npm workspace には含めない）"
+}
