@@ -253,8 +253,8 @@ export async function runCleanup(db: Db, storage: Storage, now = Date.now()): Pr
   if (storage.list) {
     const known = new Set((await all<{ storage_key: string }>(db, 'SELECT storage_key FROM assets')).map((r) => r.storage_key))
     for (const obj of await storage.list('projects/')) {
-      if (known.has(obj.key) || obj.uploadedAt.getTime() > now - CLEANUP_GRACE_MS) continue
-      await storage.delete(obj).catch(() => {})
+      if (known.has(obj.key) || (obj.uploadedAt?.getTime() ?? 0) > now - CLEANUP_GRACE_MS) continue
+      await storage.delete(obj.key).catch(() => {})
       result.orphanBlobsDeleted++
     }
   }

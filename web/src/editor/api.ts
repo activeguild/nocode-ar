@@ -95,14 +95,16 @@ async function uploadAsset(id: string, kind: AssetKind, file: Blob, meta: Upload
   if (uploadMode === 'blob') {
     const { upload } = await import('@vercel/blob/client')
     const ext = extOf(file, kind)
+    const contentType = guessContentType(kind, file, ext)
+    const type = kind === 'overlay' ? (contentType.startsWith('video/') ? 'video' : contentType.startsWith('image/') ? 'image' : 'model') : undefined
     const pathname = `projects/${id}/${kind}/${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.${ext}`
     let blob
     try {
       blob = await upload(pathname, file, {
         access: 'public',
         handleUploadUrl: `/api/projects/${id}/blob-upload`,
-        clientPayload: JSON.stringify({ kind }),
-        contentType: guessContentType(kind, file, ext),
+        clientPayload: JSON.stringify({ kind, type }),
+        contentType,
         multipart: file.size > 8 * 1024 * 1024,
       })
     } catch (e) {

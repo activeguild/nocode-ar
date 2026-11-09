@@ -3,7 +3,7 @@ import { LIMITS, type AssetInfo, type AssetKind } from '../../shared/src/index.j
 import type { Db, Queryable } from './db.js'
 import { all, nowIso, num, one } from './db.js'
 import { newId } from './ids.js'
-import type { Storage } from './storage.js'
+import { isValidKey, type Storage } from './storage.js'
 
 export interface Detected {
   mime: string
@@ -215,7 +215,7 @@ export async function saveAsset(db: Db, storage: Storage, input: SaveAssetInput)
   try {
     await insertAsset(db, row)
   } catch (e) {
-    await storage.delete(stored).catch(() => {})
+    await storage.delete(stored.key).catch(() => {})
     throw e
   }
   return row
@@ -226,8 +226,10 @@ export interface RegisterAssetInput {
   userId: string
   accountQuotaBytes: number
   kind: AssetKind
-  url: string
+  /** クライアントが申告した pathname（自プロジェクト配下の規約に一致することを必須とする） */
   key: string
+  /** クライアントが申告した URL（任意）。ストアが返す URL と一致しなければ拒否。取得・削除には一切使わない */
+  url?: string | null
   width?: number | null
   height?: number | null
   durationSec?: number | null
@@ -236,26 +238,28 @@ export interface RegisterAssetInput {
 const HEAD_BYTES = 64 * 1024
 
 /**
- * クライアントが Blob に直接アップロードした素材を登録する。
- * pathname の所有権（projects/<projectId>/<kind>/）を確認し、先頭 64 KB をレンジ取得して検証する。
- * 検証に失敗した Blob は削除する。
+ * クライアントが Blob に直接アップロードした素材を登録する（B-R3-01 対応）。
+ * - pathname は `projects/<projectId>/<kind>/<name>` に一致する自プロジェクトのものだけ受け付ける
+ * - メタデータと URL は自ストアを pathname で照会した結果（storage.stat）をサーバ側の正とし、クライアントの url は照合にしか使わない
+ * - 先頭 64 KB をレンジ取得して形式・寸法・上限を検証する。失敗した場合に削除するのは、この自プロジェクト配下の pathname のみ
  */
 export async function registerUploadedAsset(db: Db, storage: Storage, input: RegisterAssetInput): Promise<AssetRow> {
-  const { projectId, kind, url, key } = input
+  const { projectId, kind, key } = input
   const prefix = `projects/${projectId}/${kind}/`
-  if (!key.startsWith(prefix) || !/^[A-Za-z0-9_./-]{1,200}$/.test(key) || key.includes('..')) throw new AssetError(400, '素材のパスが不正です')
-  const obj = { key, url }
+  if (!isValidKey(key) || !key.startsWith(prefix)) throw new AssetError(400, '素材のパスが不正です')
+  const stat = await storage.stat(key)
+  if (!stat) throw new AssetError(400, 'アップロードされた素材が見つかりません')
+  if (stat.key !== key) throw new AssetError(400, '素材のパスが一致しません')
+  if (input.url && input.url !== stat.url) throw new AssetError(400, '素材の URL が一致しません')
   const fail = async (e: unknown) => {
-    await storage.delete(obj).catch(() => {})
+    await storage.delete(key).catch(() => {})
     throw e
   }
-  const head = await storage.head(url)
-  if (!head) throw new AssetError(400, 'アップロードされた素材が見つかりません')
   let v: Validated
   try {
-    const bytes = await storage.readRange(url, 0, Math.min(HEAD_BYTES, Math.max(head.size, 1)) - 1)
-    v = validateAsset(kind, bytes, head.size, input)
-    await checkQuotas(db, projectId, input.userId, input.accountQuotaBytes, head.size)
+    const bytes = await storage.readRange(key, 0, Math.min(HEAD_BYTES, Math.max(stat.size, 1)) - 1)
+    v = validateAsset(kind, bytes, stat.size, input)
+    await checkQuotas(db, projectId, input.userId, input.accountQuotaBytes, stat.size)
   } catch (e) {
     return fail(e)
   }
@@ -266,10 +270,10 @@ export async function registerUploadedAsset(db: Db, storage: Storage, input: Reg
     kind,
     mime: v.mime,
     ext: v.ext,
-    size_bytes: head.size,
+    size_bytes: stat.size,
     storage: storage.kind,
     storage_key: key,
-    url,
+    url: stat.url,
     width: v.width,
     height: v.height,
     duration_sec: input.durationSec ?? null,
@@ -292,7 +296,8 @@ export async function listAssets(db: Queryable, projectId: string): Promise<Asse
   return all<AssetRow>(db, 'SELECT * FROM assets WHERE project_id = $1 ORDER BY created_at', [projectId])
 }
 
+/** DB に登録済みの素材だけを、その storage_key で削除する（URL では削除しない） */
 export async function deleteAsset(db: Queryable, storage: Storage, a: AssetRow) {
   await db.query('DELETE FROM assets WHERE id = $1', [a.id])
-  await storage.delete({ key: a.storage_key, url: a.url }).catch(() => {})
+  await storage.delete(a.storage_key).catch(() => {})
 }

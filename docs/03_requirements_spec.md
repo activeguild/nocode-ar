@@ -273,7 +273,7 @@ AnalyticsEvent  id, projectId, sceneVersionId, type('page_open'|'blocked'|'view_
 | `GET /api/projects/:id`, `PATCH /api/projects/:id`, `DELETE /api/projects/:id` | 要 | 取得、名前・印刷幅・下書きシーンの更新、削除 |
 | `POST /api/projects/:id/assets` (multipart: kind, file) | 要 | 直接アップロード（ローカル / 常駐構成）。検証（NFR-4, NFR-9） |
 | `POST /api/projects/:id/blob-upload` | 要 | Vercel Blob 直接アップロードのトークン発行（所有権・kind・パス・サイズ・Content-Type を検証） |
-| `POST /api/projects/:id/assets/register` | 要 | Blob に直接アップロードした素材の登録（先頭 64 KB を取得してマジックバイト・寸法・上限を検証） |
+| `POST /api/projects/:id/assets/register` | 要 | Blob に直接アップロードした素材の登録。`pathname`（自プロジェクト配下の規約に一致）を自ストアに照会してサーバ側の URL・サイズを得、先頭 64 KB を取得してマジックバイト・寸法・上限を検証。クライアントの `url` は照合のみで、取得・削除には使わない |
 | `GET /api/cron/cleanup` | Bearer `CRON_SECRET` | 未参照素材・迷子 Blob・期限切れセッションの掃除（Vercel Cron から呼ばれる） |
 | `DELETE /api/projects/:id/assets/:assetId` | 要 | 素材削除（公開版が参照中なら拒否） |
 | `POST /api/projects/:id/publish` | 要 | 公開 / 再公開（下書きのスナップショットを SceneVersion に保存） |
@@ -488,3 +488,13 @@ Major D-01〜D-05 はすべて修正。Minor は D-10 / D-13 / D-19 / D-20 を�
 | 掃除 | PATCH / 公開時の同期処理 → Vercel Cron（日次。Pro なら毎時） | Q4 の「15 分の猶予後」は「猶予後、次の掃除で」になる |
 | 圧縮 | Express `compression` → Vercel CDN（Vercel 上） | NFR-2 の転送量目標は同じ（gzip / brotli） |
 | 運用 | `npm run migrate`（スキーマ）、Vercel の環境変数（`.env.example` 参照）、`Dockerfile` は参考 | NFR-11 |
+
+### 13.1 QA ラウンド 3（B-R3-01, M-R3-01〜04）への対応
+
+| # | 対応 |
+| --- | --- |
+| B-R3-01 | `register` はクライアントの `url` を取得・削除に使わない。`pathname` の規約一致（自プロジェクト・要求 kind）を必須にし、ストレージを pathname で照会（Blob: `head(pathname, {token})`）した URL・サイズを正とする。`url` が渡された場合は一致のみ確認。削除はすべて pathname（DB の `storage_key`）指定。回帰テスト: 外部 URL → 400 かつ fetch なし / 他人の Blob URL + kind 不一致 → 400 かつ削除なし / 他人の Blob URL + kind 一致 → 400 / 正規 → 201（`server/test/api.test.ts`）、Blob アダプタの照会・fetch 先・削除指定（`server/test/storage.test.ts`） |
+| M-R3-01 | アップロードトークンはオーバーレイの種別（video 50 MB / image 10 MB / model 20 MB）ごとの上限と Content-Type |
+| M-R3-02 | `vercel.json` の headers に `/(v|p)/(.*)` → `Cache-Control: no-cache` を追加 |
+| M-R3-03 | マイグレーション SQL を `server/src/migrations.ts` に埋め込み（`.sql` と同一であることをテストで保証）。関数バンドルはファイルに依存しない |
+| M-R3-04 | Cron の Bearer 比較を `timingSafeEqual` に。未知の `/api/*` は日本語 JSON の 404 |

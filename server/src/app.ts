@@ -1,4 +1,5 @@
 import compression from 'compression'
+import { timingSafeEqual } from 'node:crypto'
 import express, { type NextFunction, type Request, type Response } from 'express'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -289,15 +290,25 @@ export function createApp({ db, storage, config }: AppDeps) {
         request: req,
         onBeforeGenerateToken: async (pathname, clientPayload) => {
           let kind: AssetKind | null = null
+          let type: string | null = null
           try {
-            kind = JSON.parse(clientPayload ?? '{}').kind ?? null
+            const payload = JSON.parse(clientPayload ?? '{}')
+            kind = payload.kind ?? null
+            type = payload.type ?? null
           } catch {
             kind = null
           }
           if (!kind || !ASSET_KINDS.includes(kind)) throw new Error('kind が不正です')
           const re = new RegExp(`^projects/${p.id}/${kind}/[A-Za-z0-9_.-]{1,80}$`)
           if (!re.test(pathname)) throw new Error('アップロード先のパスが不正です')
-          const lim = KIND_LIMITS[kind]
+          // M-R3-01: オーバーレイは種別（video / image / model）ごとの上限と Content-Type にする
+          let lim = KIND_LIMITS[kind]
+          if (kind === 'overlay') {
+            if (type === 'video') lim = { maxBytes: LIMITS.videoBytes, contentTypes: ['video/mp4'] }
+            else if (type === 'image') lim = { maxBytes: LIMITS.imageBytes, contentTypes: ['image/png', 'image/jpeg', 'image/webp'] }
+            else if (type === 'model') lim = { maxBytes: LIMITS.modelBytes, contentTypes: ['model/gltf-binary', 'application/octet-stream'] }
+            else throw new Error('コンテンツの種別（video / image / model）を指定してください')
+          }
           return {
             allowedContentTypes: lim.contentTypes,
             maximumSizeInBytes: lim.maxBytes,
@@ -322,7 +333,8 @@ export function createApp({ db, storage, config }: AppDeps) {
       const body = z
         .object({
           kind: z.enum(ASSET_KINDS),
-          url: z.string().url().max(2048),
+          // url は照合用（任意）。取得・削除には使わない（B-R3-01）
+          url: z.string().url().max(2048).optional(),
           pathname: z.string().min(1).max(200),
           width: z.coerce.number().positive().optional(),
           height: z.coerce.number().positive().optional(),
@@ -335,8 +347,8 @@ export function createApp({ db, storage, config }: AppDeps) {
         userId: req.user!.id,
         accountQuotaBytes: config.accountQuotaBytes,
         kind: body.data.kind,
-        url: body.data.url,
         key: body.data.pathname,
+        url: body.data.url ?? null,
         width: body.data.width ?? null,
         height: body.data.height ?? null,
         durationSec: body.data.durationSec ?? null,
@@ -563,7 +575,9 @@ export function createApp({ db, storage, config }: AppDeps) {
     '/api/cron/cleanup',
     wrap(async (req, res) => {
       if (!config.cronSecret) throw new HttpError(503, 'CRON_SECRET が設定されていません')
-      if (req.headers.authorization !== `Bearer ${config.cronSecret}`) throw new HttpError(401, 'unauthorized')
+      const expected = Buffer.from(`Bearer ${config.cronSecret}`)
+      const given = Buffer.from(String(req.headers.authorization ?? ''))
+      if (expected.length !== given.length || !timingSafeEqual(expected, given)) throw new HttpError(401, '認証に失敗しました')
       res.json(await runCleanup(db, storage))
     }),
   )
@@ -588,6 +602,11 @@ export function createApp({ db, storage, config }: AppDeps) {
       })
     }),
   )
+
+  // 未知の API パス（M-R3-04）
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'ページが見つかりません' })
+  })
 
   app.get('/healthz', (_req, res) => {
     res.json({ ok: true, time: nowIso(), db: db.kind, storage: storage.kind })

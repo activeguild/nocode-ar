@@ -1,8 +1,6 @@
 // DB アダプタ: 本番は PostgreSQL（pg）、ローカル / テストは PGlite（WASM の Postgres）。
 // どちらも $1 形式のプレースホルダと同じ SQL 方言で動くため、ここで薄く揃える。
-import fs from 'node:fs'
-import path from 'node:path'
-import { repoRoot } from './config.js'
+import { MIGRATIONS } from './migrations.js'
 
 export interface QueryResult<T> {
   rows: T[]
@@ -91,7 +89,7 @@ async function openPg(connectionString: string, attach: boolean): Promise<Db> {
 async function openPglite(dir: string | null): Promise<Db> {
   const { PGlite } = await import('@electric-sql/pglite')
   const inMemory = !dir || dir === ':memory:'
-  if (!inMemory) fs.mkdirSync(dir!, { recursive: true })
+  if (!inMemory) (await import('node:fs')).mkdirSync(dir!, { recursive: true })
   const pg = inMemory ? await PGlite.create() : await PGlite.create({ dataDir: dir! })
   const db: Db = {
     kind: 'pglite',
@@ -114,25 +112,18 @@ async function openPglite(dir: string | null): Promise<Db> {
   return db
 }
 
-export const migrationsDir = path.join(repoRoot, 'server', 'migrations')
-
-/** server/migrations/*.sql を名前順に適用する（schema_migrations で管理） */
+/** 埋め込みマイグレーション（server/src/migrations.ts = server/migrations/*.sql）を名前順に適用する（schema_migrations で管理） */
 export async function runMigrations(db: Db): Promise<string[]> {
   await db.query('CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)')
   const applied = new Set((await all<{ name: string }>(db, 'SELECT name FROM schema_migrations')).map((r) => r.name))
-  const files = fs
-    .readdirSync(migrationsDir)
-    .filter((f) => f.endsWith('.sql'))
-    .sort()
   const done: string[] = []
-  for (const f of files) {
-    if (applied.has(f)) continue
-    const sql = fs.readFileSync(path.join(migrationsDir, f), 'utf8')
+  for (const m of [...MIGRATIONS].sort((a, b) => a.name.localeCompare(b.name))) {
+    if (applied.has(m.name)) continue
     await db.tx(async (q) => {
-      await q.exec(sql)
-      await q.query('INSERT INTO schema_migrations (name, applied_at) VALUES ($1, $2)', [f, nowIso()])
+      await q.exec(m.sql)
+      await q.query('INSERT INTO schema_migrations (name, applied_at) VALUES ($1, $2)', [m.name, nowIso()])
     })
-    done.push(f)
+    done.push(m.name)
   }
   return done
 }

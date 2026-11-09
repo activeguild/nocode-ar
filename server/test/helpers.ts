@@ -16,7 +16,7 @@ function sharedDb(): Promise<Db> {
   return shared
 }
 
-export type TestStorage = Storage & { objects?: Map<string, { body: Buffer; contentType: string }> }
+export type TestStorage = Storage & { objects?: Map<string, { body: Buffer; contentType: string; uploadedAt: Date }> }
 
 /** storageKind: 'local' = ファイル保存（/a/ 配信のテスト）、'memory' = Blob 相当（登録・掃除のテスト） */
 export async function makeTestApp(overrides: Partial<Config> = {}, storageKind: 'local' | 'memory' = 'local') {

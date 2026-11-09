@@ -96,7 +96,7 @@ mkdir -p .vercel && echo '{"projectId":"prj_dummy","orgId":"team_dummy"}' > .ver
 npx vercel build        # .vercel/output に functions/api/index.func と static/ が生成される
 ```
 
-（`.vercel/` は git 管理外。実際のデプロイには `vercel link` で本物のプロジェクトに紐付ける）
+（`.vercel/` は git 管理外。実際のデプロイには `vercel link` で本物のプロジェクトに紐付ける。マイグレーション SQL は `server/src/migrations.ts` に埋め込まれているため、出力された関数はファイルのコピーなしで単体起動できる）
 
 ## 常駐サーバとして起動（Vercel 以外。参考）
 

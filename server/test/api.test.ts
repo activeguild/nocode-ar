@@ -406,10 +406,14 @@ describe('QA 曖昧点の確定仕様（Q1, Q2, Q4）', () => {
     expect(t.storage.objects!.has(`projects/${p.id}/overlay/${old.body.asset.id}.glb`)).toBe(false)
     // 参照中の素材は残る
     expect(await count('SELECT COUNT(*) AS n FROM assets WHERE id = $1', [scene.overlay!.assetId])).toBe(1)
-    // 迷子の Blob（DB に無い）も掃除される
-    await t.storage.put(`projects/${p.id}/overlay/orphan.png`, tinyPng(), 'image/png')
+    // 迷子の Blob（DB に無い）も、猶予（15 分）を過ぎていれば掃除される
+    const orphan = await t.storage.put(`projects/${p.id}/overlay/orphan.png`, tinyPng(), 'image/png')
+    r = await cron()
+    expect(r.body.orphanBlobsDeleted).toBe(0)
+    t.storage.objects!.get(orphan.key)!.uploadedAt = new Date(0)
     r = await cron()
     expect(r.body.orphanBlobsDeleted).toBe(1)
+    expect(t.storage.objects!.has(orphan.key)).toBe(false)
   })
 })
 
@@ -547,30 +551,99 @@ describe('Vercel 構成（Blob 直接アップロードの登録、Cron、健全
     const other = await createProject(cookie, '別プロジェクト')
     // クライアントが Blob に置いた想定で memory storage に直接オブジェクトを置く
     const put = (key: string, body: Buffer, type: string) => t.storage.put(key, body, type)
+    const register = (pid: string, body: object) => request(t.app).post(`/api/projects/${pid}/assets/register`).set('Cookie', cookie).send(body)
     const okPng = await put(`projects/${p.id}/target_image/a1.png`, tinyPng(300, 200), 'image/png')
-    const reg = await request(t.app).post(`/api/projects/${p.id}/assets/register`).set('Cookie', cookie).send({ kind: 'target_image', url: okPng.url, pathname: okPng.key, width: 1, height: 1 })
+    const reg = await register(p.id, { kind: 'target_image', url: okPng.url, pathname: okPng.key, width: 1, height: 1 })
     expect(reg.status).toBe(201)
     expect(reg.body.asset).toMatchObject({ mime: 'image/png', width: 300, height: 200, url: okPng.url })
+    // url を省略しても pathname だけで登録できる（URL はストアが返すものを採用）
+    const okPng2 = await put(`projects/${p.id}/overlay/a2.png`, tinyPng(10, 10), 'image/png')
+    const reg2 = await register(p.id, { kind: 'overlay', pathname: okPng2.key })
+    expect(reg2.status).toBe(201)
+    expect(reg2.body.asset.url).toBe(okPng2.url)
 
     // 他プロジェクトのパス（所有権違反）
     const foreign = await put(`projects/${other.id}/overlay/x.png`, tinyPng(), 'image/png')
-    expect((await request(t.app).post(`/api/projects/${p.id}/assets/register`).set('Cookie', cookie).send({ kind: 'overlay', url: foreign.url, pathname: foreign.key })).status).toBe(400)
+    expect((await register(p.id, { kind: 'overlay', url: foreign.url, pathname: foreign.key })).status).toBe(400)
+    expect(t.storage.objects!.has(foreign.key)).toBe(true)
     // kind とパスの不一致
-    expect((await request(t.app).post(`/api/projects/${p.id}/assets/register`).set('Cookie', cookie).send({ kind: 'overlay', url: okPng.url, pathname: okPng.key })).status).toBe(400)
-    // 形式不正（HTML を PNG として登録）→ 400 かつ Blob 削除
+    expect((await register(p.id, { kind: 'overlay', url: okPng.url, pathname: okPng.key })).status).toBe(400)
+    expect(t.storage.objects!.has(okPng.key)).toBe(true)
+    // 形式不正（HTML を PNG として登録）→ 400 かつ自分の Blob は削除
     const bad = await put(`projects/${p.id}/overlay/bad.png`, Buffer.from('<html>not an image at all</html>'), 'image/png')
-    const badRes = await request(t.app).post(`/api/projects/${p.id}/assets/register`).set('Cookie', cookie).send({ kind: 'overlay', url: bad.url, pathname: bad.key })
+    const badRes = await register(p.id, { kind: 'overlay', url: bad.url, pathname: bad.key })
     expect(badRes.status).toBe(400)
     expect(t.storage.objects!.has(bad.key)).toBe(false)
     // MOV → R5 文言
     const mov = await put(`projects/${p.id}/overlay/v.mov`, tinyMp4('qt  '), 'video/quicktime')
-    const movRes = await request(t.app).post(`/api/projects/${p.id}/assets/register`).set('Cookie', cookie).send({ kind: 'overlay', url: mov.url, pathname: mov.key })
-    expect(movRes.body.code).toBe('mov')
-    // 存在しない URL
-    expect((await request(t.app).post(`/api/projects/${p.id}/assets/register`).set('Cookie', cookie).send({ kind: 'overlay', url: 'memory://store/projects/' + p.id + '/overlay/none.png', pathname: `projects/${p.id}/overlay/none.png` })).status).toBe(400)
+    expect((await register(p.id, { kind: 'overlay', url: mov.url, pathname: mov.key })).body.code).toBe('mov')
+    // 存在しない pathname
+    expect((await register(p.id, { kind: 'overlay', pathname: `projects/${p.id}/overlay/none.png` })).status).toBe(400)
     // .mind
     const mind = await put(`projects/${p.id}/target_mind/t.mind`, tinyMind(10), 'application/octet-stream')
-    expect((await request(t.app).post(`/api/projects/${p.id}/assets/register`).set('Cookie', cookie).send({ kind: 'target_mind', url: mind.url, pathname: mind.key })).status).toBe(201)
+    expect((await register(p.id, { kind: 'target_mind', url: mind.url, pathname: mind.key })).status).toBe(201)
+  })
+
+  it('B-R3-01: クライアントの url を信用しない（SSRF 不可、他ユーザーの Blob を登録・削除できない）', async () => {
+    t.cleanup()
+    t = await makeTestApp({}, 'memory')
+    const attacker = await signup('attacker@example.com')
+    const victimCookie = await signup('victim@example.com')
+    const mine = await createProject(attacker, '攻撃者')
+    const victim = await createProject(victimCookie, '被害者')
+    const register = (body: object) => request(t.app).post(`/api/projects/${mine.id}/assets/register`).set('Cookie', attacker).send(body)
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+
+    // (1) 外部 URL（127.0.0.1 等）→ 400、サーバは一切 fetch しない
+    const ssrf = await register({ kind: 'target_image', url: 'http://127.0.0.1:9/internal/anything.png', pathname: `projects/${mine.id}/target_image/x.png` })
+    expect(ssrf.status).toBe(400)
+    expect(fetchSpy).not.toHaveBeenCalled()
+
+    // 被害者の公開中素材（Blob URL は公開 API で誰でも取得できる）
+    const victimScene = await makeReady(victimCookie, victim.id)
+    await request(t.app).post(`/api/projects/${victim.id}/publish`).set('Cookie', victimCookie)
+    const pub = await request(t.app).get(`/api/public/${victim.slug}`)
+    const victimAsset = pub.body.assets[victimScene.overlay!.assetId]
+    const victimKey = `projects/${victim.id}/overlay/${victimScene.overlay!.assetId}.png`
+    expect(t.storage.objects!.has(victimKey)).toBe(true)
+
+    // (2) 被害者の URL + 自分の pathname（kind 不一致）→ 400、被害者の Blob は残る
+    const r2 = await register({ kind: 'target_image', url: victimAsset.url, pathname: `projects/${mine.id}/target_image/y.png` })
+    expect(r2.status).toBe(400)
+    expect(t.storage.objects!.has(victimKey)).toBe(true)
+    // (2') 被害者の pathname をそのまま渡す → 所有権違反で 400、削除されない
+    const r2b = await register({ kind: 'overlay', url: victimAsset.url, pathname: victimKey })
+    expect(r2b.status).toBe(400)
+    expect(t.storage.objects!.has(victimKey)).toBe(true)
+
+    // (3) 被害者の URL + kind 一致 + 自分の実在する pathname → URL 不一致で 400（他人の素材を自分の素材として登録できない）
+    const own = await t.storage.put(`projects/${mine.id}/overlay/own.png`, tinyPng(), 'image/png')
+    const r3 = await register({ kind: 'overlay', url: victimAsset.url, pathname: own.key })
+    expect(r3.status).toBe(400)
+    expect(r3.body.error).toContain('一致しません')
+    expect(t.storage.objects!.has(victimKey)).toBe(true)
+    expect(await count('SELECT COUNT(*) AS n FROM assets WHERE project_id = $1', [mine.id])).toBe(0)
+
+    // (4) 正規の自分の Blob → 201、url はストアが返したもの
+    const r4 = await register({ kind: 'overlay', url: own.url, pathname: own.key })
+    expect(r4.status).toBe(201)
+    expect(r4.body.asset.url).toBe(own.url)
+    // 自分の素材を削除しても被害者の Blob には触れない
+    await request(t.app).delete(`/api/projects/${mine.id}/assets/${r4.body.asset.id}`).set('Cookie', attacker)
+    expect(t.storage.objects!.has(own.key)).toBe(false)
+    expect(t.storage.objects!.has(victimKey)).toBe(true)
+    expect((await request(t.app).get(`/api/public/${victim.slug}`)).status).toBe(200)
+    expect(fetchSpy).not.toHaveBeenCalled()
+    fetchSpy.mockRestore()
+  })
+
+  it('M-R3-04: 未知の API パスは日本語 JSON の 404、Cron の認証はタイミングセーフ比較', async () => {
+    const nf = await request(t.app).get('/api/nothing-here')
+    expect(nf.status).toBe(404)
+    expect(nf.body.error).toBe('ページが見つかりません')
+    const partial = await request(t.app).get('/api/cron/cleanup').set('Authorization', 'Bearer test-cron-secre')
+    expect(partial.status).toBe(401)
+    expect(partial.body.error).toBe('認証に失敗しました')
   })
 
   it('/api/config は uploadMode を返し、ストレージが local のときは register を使わせない', async () => {
