@@ -327,3 +327,99 @@ Minor の修正確認（デグレなし）: D-07（PATCH 400 は「入力内容�
 | 16 | （QA 同席）PC のプロキシ経由で 1〜8 を行う | 通信記録に映像・画像の送信が無い（QA が確認） | TC-K5-02 |
 | 17 | （オーナー環境）`docker build -t nocode-ar .` → `docker run -p 3000:3000 -v nocode-ar-data:/data -e PUBLIC_ORIGIN=... nocode-ar` | ビルド成功、`/healthz` が 200、登録〜公開〜閲覧が動く | TC-N-05（D-09） |
 | 18 | （マーケター推薦のテスター 3 名）手元の素材で登録 → 公開を 30 分以内に | 2 名以上が 30 分以内。詰まった箇所を記録 | TC-K7-01 |
+
+---
+
+# ラウンド 3（Vercel 構成への載せ替えのデグレ確認と新構成の検証）
+
+- 実施日: 2026-11-09
+- 対象: コミット `c1909e5`（Move to Vercel: Functions entry, PostgreSQL/PGlite adapter, Vercel Blob storage, cron cleanup, docs）、`644b2b0`（zod override）。要件定義 §13、`docs/04_architecture.md`「Vercel 構成」、README「Vercel へのデプロイ」
+- 判定: **不合格（Blocker 1 件: Blob 直接アップロードの登録 API `POST /api/projects/:id/assets/register` が `url` を検証しない）**。ローカル構成（PGlite + ローカル素材）では機能・セキュリティともにデグレなし。Blocker は Vercel（Blob）構成でのみ露出するが、本番基盤が Vercel になったため合格にできない。修正は小さく（`url` が自ストアの Blob URL で、かつ `pathname` と一致することの検証）、修正後は該当ケースの再確認のみで合格判定に進める。
+
+## R3-1. 環境・手順
+
+ラウンド 2 と同じ環境。本ラウンドで追加したもの:
+
+| 項目 | 内容 |
+| --- | --- |
+| ローカルサーバ | `node server/dist/server/src/index.js`（`DATA_DIR=<scratchpad>/qa/data-r3`、PGlite + ローカル素材、`CRON_SECRET` 設定）。`/healthz` → `{"ok":true,"db":"pglite","storage":"local"}` |
+| QA スクリプト | `api-tests.mjs`（SQLite 直接参照だった 11 項目は SKIP にし、`r3-checks.mts` で PGlite を直接参照して実施）、`ui-tests-2.mjs`、新規 `r3-checks.mts`（PGlite インメモリ + メモリ / Blob ストレージアダプタで、DB 依存ケース・Cron・`assets/register` の認可と検証・SSRF）、`func-invoke.mjs`（`npx vercel build` の成果物を Node から直接起動） |
+| `npx vercel build` | ダミーの `.vercel/project.json` で実行し成功（`.vercel/output/`。git 管理外）。ローカル起動のため `server/migrations` を関数ディレクトリへコピーした（後述） |
+| 検証不可 | 実デプロイ（Neon 接続、Blob への実アップロード・Range GET、Cron の実行、CDN 圧縮）。Docker デーモンも引き続き無し |
+
+## R3-2. 自動テスト（再実行）
+
+| コマンド | 結果 |
+| --- | --- |
+| `npm run typecheck` | 成功 |
+| `npm test` | Vitest 47 件 すべて成功（PGlite インメモリ。Blob 登録・Cron・設定エラーのテストが追加） |
+| `npm run e2e` | 24 ステップ すべて成功、コンソールエラー 0 件（PGlite + ローカル素材） |
+| `npm audit` | 0 件（`644b2b0` の zod override 後） |
+| QA `api-tests.mjs`（ローカル構成） | 112 項目中 PASS 100 / SKIP 11（DB 直接確認 → `r3-checks.mts` で代替）/ FAIL 1（TC-M6-03。SceneVersion ID の DB 比較がスタブ化されたための検証側要因。公開版が不変であることは TC-M5-02（プレビュー = 下書き、公開 API = 公開版）と開発者テスト「下書きを編集しても公開版は変わらない」で確認） |
+| QA `ui-tests-2.mjs` | 18 項目中 PASS 17 / FAIL 1（D-20 JPEG ターゲットのフェイクカメラ認識、実機確認へ） |
+| QA `r3-checks.mts` | 25 項目中 PASS 24 / FAIL 1（**TC-R3-SSRF**、§R3-4） |
+| サーバログ | `level: error` 0 行 |
+
+## R3-3. デグレ確認（ローカル構成）
+
+ラウンド 2 で合格した機能・セキュリティケースはすべて維持されている。
+
+| 区分 | 確認内容 | 結果 |
+| --- | --- | --- |
+| TC-S 全件 | 未認証 401（17 エンドポイント）、他ユーザー 404、アップロード偽装（拡張子 / MIME / 0 バイト / SVG / GIF ポリグロット / kind 不正 / MP4 以外の ISO-BMFF）、パストラバーサル（保存先 `data/assets/projects/<pid>/<kind>/<id>.<ext>`、`/a/../`、`%2e%2e`、他人 assetId の DELETE・参照）、固定 ID / パスワード・接続文字列・トークンの埋め込みなし（`.env.example` はキー名のみ、`.env` / `.vercel` は未追跡、README の `postgres://...` はプレースホルダ）、Cookie 属性・無効化・ID 更新、CSRF `Origin` 検査、scrypt、XSS・CSV 無害化、エラー応答（1 MB 超 413、スタック漏えいなし）、`npm audit` 0、未公開素材の非露出（D-01 維持） | ○ |
+| TC-M6-03 / TC-S-11 | 公開後に下書きで差し替えた素材が公開 API に出ない。公開版の内容・素材 URL は下書き編集で変わらない | ○ |
+| TC-M7 ロック・レート制限（DB 化） | 10 回失敗で 429 が `login_locks` に記録され、60 秒後に 1 回照合（D-21）。`rate_limits` の原子的加算で 61 回目以降 429、別 slug は受理、存在しない slug は常に 404（D-16） | ○ |
+| TC-N-01 容量 | 50 MiB × 2 + PNG → 413 quota。アカウント合計上限の実装維持 | ○ |
+| DB 依存ケース（PGlite） | 期限切れセッション 401、`analytics_events` に IP / UA 列なし、JST 境界（`COUNT` が数値で返る）、10 世代保持、停止中 slug の `page_open` 受理 / `cta_tap` 400、sha256 一致（ローカル保存） | ○ |
+| Cron | Bearer なし / 誤り 401、未設定 503、正しい secret で 200 と `{assetsDeleted, orphanBlobsDeleted, sessionsDeleted}`。15 分超の未参照素材を削除、参照中・猶予内は残す | ○ |
+| UI（ui-tests-2） | 認識（PNG）、差し替え、R7、解析中の離脱 / 2 秒以内の遷移、カメラ拒否、axe、削除ダイアログ、スマホ幅、日本語、ログアウト | ○（D-20 のみ従来どおり） |
+| 転送量 | ローカル構成では `compression` が有効のまま（Vercel 上は CDN に委ねる設計。実測は実デプロイ後） | ○ |
+
+## R3-4. 新構成固有の確認
+
+| # | 確認項目 | 結果 |
+| --- | --- | --- |
+| (a) `npx vercel build` | 成功。`.vercel/output/config.json`: ヘッダ（`/assets/*` immutable、`/(index\|viewer).html` no-cache、全体 nosniff）→ `handle: filesystem` → `/api/*`, `/a/*`, `/healthz` → `/api/index` → `/v/:slug` → `/viewer.html?slug=`、`/p/:token` → `/viewer.html?token=` → 除外付き catch-all → `/index.html`。`crons: [{path: /api/cron/cleanup, schedule: 0 3 * * *}]`。`.vc-config.json`: `runtime: nodejs22.x`、`memory: 1024`、`maxDuration: 30`、`handler: api/index.js`、`filePathMap` に `server/migrations/001_init.sql`。関数バンドル 8.9 MB（`@electric-sql/pglite` は除外、`pg` / `@vercel/blob` / `@vercel/functions` / `compression` / `express` / `multer` / `qrcode` を同梱）。**コンパイル済み関数を Node から直接起動**: `/healthz` 200 `{db:"pglite",storage:"local"}`、`/api/config` 200、`/api/cron/cleanup` Bearer なし 401 / 誤り 401 / 正しい secret 200、`/api/public/<不明>` 404、`/a/<不明>` 404。ただし **ローカル起動では `server/migrations` が関数ディレクトリに無く `ENOENT`**（`filePathMap` はデプロイ時に配置される参照のため）。`server/migrations` を手でコピーすると動作。Vercel 上では `DATABASE_URL` 必須のため `AUTO_MIGRATE` 未設定ならこのパスは通らない（§R3-5 M-R3-03） | ○（注記あり） |
+| (b) `blob-upload` / `assets/register` の認可・検証 | メモリアダプタ: 未認証 401、他ユーザーのプロジェクト ID → 404（`blob-upload` も 404）、他プロジェクト配下の `pathname` → 400、`..` → 400、Content-Type を `image/png` と偽った GLB → 400 で Blob 削除、10 MB 超 → 413 で Blob 削除、寸法は申告値でなく先頭 64 KB のヘッダから、存在しない Blob → 400。**しかし `url` と `pathname` の対応が検証されず、`url` が自ストアの Blob URL かも検証されない**（§R3-5 B-R3-01） | × |
+| (c) rewrites | 出力 `config.json` で確認: `filesystem` が先に評価されるため `/legal.html`、`/assets/*`、`/viewer.html`、`/index.html` は実ファイルが配信される。catch-all は `assets/`, `api/`, `a/`, `v/`, `p/`, `legal.html`, `viewer.html`, `index.html`, `favicon` を除外し、未知パス（`/foo`、`/projects/xxx`）は `/index.html` へ。`/favicon.ico`（ファイル無し）と `/v/a/b`（2 セグメント）は 404。`/api/*` の未知パスは関数（Express の既定 404） | ○ |
+| (d) 秘密情報 | `.env.example` は 13 キーすべて値なし。コード・ドキュメントに接続文字列・トークンなし（grep: `postgres://user:pass@localhost:1/db` と `vercel_blob_rw_dummy` はテストのダミー、README は `postgres://...`）。`.env` / `.vercel/` は `.gitignore` 済みで未追跡 | ○ |
+| (e) migrate の冪等性 | `npm run migrate` 1 回目 `applied: ["001_init.sql"]`、2 回目 `applied: []`（`schema_migrations` で管理）。その後の起動・動作に影響なし | ○ |
+| (f) `VERCEL=1` での欠落エラー | `DATABASE_URL` なし → 「DATABASE_URL が設定されていません。Vercel では PostgreSQL（Neon）が必須です（README「Vercel へのデプロイ」参照）」、`BLOB_READ_WRITE_TOKEN` なし → 「BLOB_READ_WRITE_TOKEN が設定されていません。Vercel では素材の保存先として Vercel Blob が必須です」。両方あり（到達不能 DB）→ ランタイム生成は成功し最初のクエリで `ECONNREFUSED`（Pool は遅延接続。`vercel.ts` は失敗時に `runtimePromise` を破棄して次回再試行） | ○ |
+
+## R3-5. 不具合一覧（ラウンド 3 で新規）
+
+### Blocker（1 件）
+
+| # | 件名 | 再現手順 | 期待 / 実際 |
+| --- | --- | --- | --- |
+| **B-R3-01** | `POST /api/projects/:id/assets/register` が `url` を検証せず、任意 URL の取得（SSRF）・外部 URL の素材登録・**他ユーザーの Blob 削除**が可能 | (1) SSRF（`r3-checks.mts` TC-R3-SSRF、Blob アダプタ + ダミートークンで再現）: 自分のプロジェクトで `{"kind":"target_image","url":"http://127.0.0.1:<port>/internal/anything.png","pathname":"projects/<自分の pid>/target_image/x.png"}` を送る → サーバがその URL へ `HEAD` と `GET Range: bytes=0-65535` を実行（QA のローカル HTTP サーバで到達を観測）。応答が PNG なら **201 で登録され、`assets.url` が攻撃者の URL になる**（公開すると閲覧ページがその URL を読み込む）。(2) 他ユーザーの Blob 削除（コード確認。メモリアダプタは key ベースのため再現しないが、`createBlobStorage.delete` は `del(obj.url)` と URL ベース）: 被害者の公開中素材の Blob URL（`GET /api/public/<slug>` で誰でも取得可）を `url` に、自分のプロジェクト配下の `pathname` と不一致の `kind` を指定して register → 検証失敗の後始末 `fail()` が `storage.delete({key, url})` → `del(被害者の URL)` → **被害者の公開中素材が消える**。`kind` を合わせれば 201 で登録でき（TC-R3-REG-11: 被害者 URL を自分の素材として登録可）、その後自分の素材を DELETE しても同様に被害者の Blob が消える | 期待: `url` が自ストアの Blob URL（`isBlobUrl`。`storage.ts` に定義済みだが未使用）であり、`new URL(url).pathname` が `pathname`（`projects/<pid>/<kind>/...`）と一致することを検証する。または `@vercel/blob` の `head(url, {token})` でストア内の pathname を取得し、クライアントの `pathname` を信用しない。検証前の取得・削除は行わない。実際: `z.string().url()` のみ。`registerUploadedAsset` は `key` の接頭辞だけ確認し、`url` は `storage.head(url)` → `readRange(url)` → `delete({key,url})` にそのまま渡る |
+
+### Minor（4 件。合否に影響しない）
+
+| # | 件名 | 内容 |
+| --- | --- | --- |
+| M-R3-01 | `blob-upload` のトークンがオーバーレイに一律 50 MB を許可 | `KIND_LIMITS.overlay.maxBytes = 50 MB` のため、画像 / GLB も 50 MB まで Blob に上がってから `register` で 413 → 削除される。帯域の無駄のみ。`clientPayload` にファイル種別を含めて上限を分ける余地 |
+| M-R3-02 | `/v/:slug` 応答に `no-cache` ヘッダが付かない可能性 | `headers` の `/(index\|viewer)\.html` はリクエストパスに対して評価されるため、rewrite 元の `/v/<slug>` には適用されない見込み。Vercel の静的 HTML 既定（`max-age=0, must-revalidate`）で実害は小さい。実デプロイで `curl -I https://<host>/v/<slug>` を確認（§R3-6） |
+| M-R3-03 | 関数バンドルをローカルで起動するには `server/migrations` のコピーが必要 | `filePathMap` はデプロイ時に配置される。Vercel 上では `AUTO_MIGRATE=1` のときだけ `runMigrations` が走り、`repoRoot` は `/var/task` に解決される想定だが未検証。README の「手動 migrate を推奨」どおり運用すれば影響なし |
+| M-R3-04 | `/api/cron/cleanup` の Bearer 比較が定数時間でない、未知の `/api/*` は Express 既定の英語 404 HTML | `req.headers.authorization !== ...` の文字列比較（`crypto.timingSafeEqual` 推奨）。未知の API パスの 404 本文が英語（ブラウザ画面には出ない） |
+
+記録（不具合ではない）: Blob 保存分は `sha256` を持たない（§13 で合意。AC-K6 は配信バイト列の一致で確認）。Cron の掃除は下書き・公開版以外の素材を削除するため、保持している過去 10 世代の SceneVersion はロールバックしても素材が無い（ラウンド 1 からの Q4 の仕様。NFR-5「ロールバック可能」と齟齬があるため次スプリントで整理を推奨）。`publicOrigin` は引き続き `X-Forwarded-Host` を参照するため Vercel では `PUBLIC_ORIGIN` 設定を推奨（README 記載済み）。
+
+## R3-6. 合格判定と、実デプロイ後にオーナーが確認する項目
+
+- Blocker 1 件（B-R3-01）のため **不合格**。修正後の再検証: `r3-checks.mts` の TC-R3-SSRF / REG-10 / REG-11 相当（`url` 不一致 → 400 かつ Blob に触れない、他ストア / 外部 URL → 400）、開発者テストへの追加を確認。ローカル構成のデグレ確認は本ラウンドの結果を流用してよい。
+- Blocker 修正後も、Vercel 固有の挙動は実デプロイでしか確認できないため、以下をオーナー（または QA 同席）で実施し、結果をレポートに追記してから最終判定とする。ラウンド 2 の実機チェックリスト（§R2-6）は本番 URL で実施する。
+
+| # | 確認項目 | 期待 |
+| --- | --- | --- |
+| 1 | `https://<host>/healthz` | `{"ok":true,"db":"pg","storage":"blob"}`（`pglite` / `local` なら環境変数未設定） |
+| 2 | `npm run migrate`（Neon の pooled 接続文字列）を 2 回 | 1 回目 `applied: ["001_init.sql"]`、2 回目 `applied: []` |
+| 3 | 作成画面で PNG（ターゲット）/ MP4 / GLB / `.mind`（解析で自動）をアップロード | ブラウザの Network で Blob（`*.public.blob.vercel-storage.com`）への PUT と `/api/projects/:id/assets/register` 201 を確認。8 MB 超の MP4 は multipart。Blob の URL に `-<random>` が付く |
+| 4 | Blob の URL を Cookie なしで `curl -I` | `access-control-allow-origin: *`（閲覧ページは別オリジンの Blob から動画 / `.mind` / GLB を取得するため CORS が必要。無いと WebGL テクスチャが汚染され動画が表示されない）、`content-type` が正しい |
+| 5 | 公開 → QR → 実機で体験（§R2-6 の 1〜14） | 動画 / 画像 / 3D が表示され、計測が 1 / 1 / 1 |
+| 6 | `curl -I -H 'Accept-Encoding: br' https://<host>/assets/<overlay chunk>.js` と `.../a/`ではなく Blob の `.mind` URL | 前者 `content-encoding: br`（CDN 圧縮）。後者は Blob の配信ヘッダを記録（`.mind` が圧縮されない場合はカメラ起動時間を実機で計測し、必要なら事前 gzip を検討） |
+| 7 | `curl -I https://<host>/v/<slug>` と `/legal.html` と `/foo` | `/v/` は viewer.html（200、`cache-control` を記録）、`/legal.html` は 200、`/foo` は index.html の 200、`/api/nothing` は 404 |
+| 8 | Vercel ダッシュボード → Cron Jobs → `/api/cron/cleanup` を手動実行 | ログに 200 と `{assetsDeleted, orphanBlobsDeleted, sessionsDeleted}`。`CRON_SECRET` を外した状態の `curl` は 401 |
+| 9 | 下書きで素材を差し替えて 15 分以上放置 → Cron 実行 | 旧素材が Blob から消え、公開版・下書きが参照する素材は残る |
+| 10 | 2 アカウントで B-R3-01 の再現手順（修正後） | 他ユーザーの Blob URL を `register` に渡しても 400 で、被害者の素材が残る |
+| 11 | `vercel logs` | `level: error` が出ていない。コールドスタート時の DB 接続エラーが無い |
