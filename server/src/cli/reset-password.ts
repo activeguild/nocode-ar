@@ -1,11 +1,10 @@
 // Q19 / D1: オーナーがパスワードを再設定する管理コマンド。
 //   npm run reset-password -- <email>
 // 新しいパスワードは対話入力（または環境変数 NEW_PASSWORD）で受け取り、引数には書かない（シェル履歴に残さないため）。
-import path from 'node:path'
 import readline from 'node:readline/promises'
-import { hashPassword } from '../auth.ts'
-import { loadConfig } from '../config.ts'
-import { openDb, nowIso } from '../db.ts'
+import { hashPassword } from '../auth.js'
+import { loadConfig } from '../config.js'
+import { nowIso, one, openDb } from '../db.js'
 
 async function main() {
   const email = (process.argv[2] ?? '').trim().toLowerCase()
@@ -24,19 +23,22 @@ async function main() {
     process.exit(2)
   }
   const config = loadConfig()
-  const db = openDb(path.join(config.dataDir, 'app.db'))
-  const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email) as { id: string } | undefined
-  if (!user) {
-    console.error(`ユーザーが見つかりません: ${email}`)
-    process.exit(1)
+  const db = await openDb({ databaseUrl: config.databaseUrl, pgliteDir: config.pgliteDir })
+  try {
+    const user = await one<{ id: string }>(db, 'SELECT id FROM users WHERE email = $1', [email])
+    if (!user) {
+      console.error(`ユーザーが見つかりません: ${email}`)
+      process.exit(1)
+    }
+    await db.tx(async (q) => {
+      await q.query('UPDATE users SET password_hash = $2 WHERE id = $1', [user.id, hashPassword(password)])
+      await q.query('DELETE FROM sessions WHERE user_id = $1', [user.id]) // 既存セッションも無効化
+      await q.query('DELETE FROM login_locks WHERE email = $1', [email])
+    })
+    console.log(JSON.stringify({ level: 'info', time: nowIso(), message: `password reset: ${email}（既存セッションは無効化）` }))
+  } finally {
+    await db.close()
   }
-  const tx = db.transaction(() => {
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(password), user.id)
-    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id) // 既存セッションも無効化
-  })
-  tx()
-  db.close()
-  console.log(JSON.stringify({ level: 'info', time: nowIso(), message: `password reset: ${email}（既存セッションは無効化）` }))
 }
 
 main().catch((e) => {

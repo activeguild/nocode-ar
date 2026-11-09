@@ -1,86 +1,143 @@
-import Database from 'better-sqlite3'
+// DB アダプタ: 本番は PostgreSQL（pg）、ローカル / テストは PGlite（WASM の Postgres）。
+// どちらも $1 形式のプレースホルダと同じ SQL 方言で動くため、ここで薄く揃える。
 import fs from 'node:fs'
 import path from 'node:path'
+import { repoRoot } from './config.js'
 
-export type Db = Database.Database
-
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS users (
-  id TEXT PRIMARY KEY,
-  email TEXT NOT NULL UNIQUE,
-  password_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS sessions (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  created_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS projects (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  name TEXT NOT NULL,
-  slug TEXT NOT NULL UNIQUE,
-  status TEXT NOT NULL DEFAULT 'draft',
-  preview_token TEXT NOT NULL UNIQUE,
-  draft_scene TEXT NOT NULL,
-  published_scene_id TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id, updated_at);
-CREATE TABLE IF NOT EXISTS assets (
-  id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  kind TEXT NOT NULL,
-  mime TEXT NOT NULL,
-  ext TEXT NOT NULL,
-  size_bytes INTEGER NOT NULL,
-  storage_path TEXT NOT NULL,
-  width INTEGER,
-  height INTEGER,
-  duration_sec REAL,
-  sha256 TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_assets_project ON assets(project_id);
-CREATE TABLE IF NOT EXISTS scene_versions (
-  id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  scene TEXT NOT NULL,
-  published_at TEXT NOT NULL,
-  published_by_user_id TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_scene_versions_project ON scene_versions(project_id, published_at);
-CREATE TABLE IF NOT EXISTS publish_events (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  type TEXT NOT NULL,
-  scene_version_id TEXT,
-  at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_publish_events_project ON publish_events(project_id, at);
-CREATE TABLE IF NOT EXISTS analytics_events (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  scene_version_id TEXT,
-  type TEXT NOT NULL,
-  button_id TEXT,
-  os TEXT NOT NULL,
-  occurred_at TEXT NOT NULL,
-  day_jst TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_analytics_project_day ON analytics_events(project_id, day_jst);
-`
-
-export function openDb(file: string): Db {
-  if (file !== ':memory:') fs.mkdirSync(path.dirname(file), { recursive: true })
-  const db = new Database(file)
-  db.pragma('journal_mode = WAL')
-  db.pragma('foreign_keys = ON')
-  db.exec(SCHEMA)
-  return db
+export interface QueryResult<T> {
+  rows: T[]
+}
+export interface Queryable {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  query<T = any>(sql: string, params?: unknown[]): Promise<QueryResult<T>>
+  /** 複数文の SQL（マイグレーション等）。パラメータなし */
+  exec(sql: string): Promise<void>
+}
+export interface Db extends Queryable {
+  kind: 'pg' | 'pglite'
+  tx<T>(fn: (q: Queryable) => Promise<T>): Promise<T>
+  migrate(): Promise<string[]>
+  close(): Promise<void>
 }
 
 export const nowIso = () => new Date().toISOString()
+
+/** pg は COUNT / SUM（bigint, numeric）を文字列で返すため数値化する */
+export const num = (v: unknown): number => (v === null || v === undefined ? 0 : Number(v))
+
+export async function one<T>(q: Queryable, sql: string, params: unknown[] = []): Promise<T | null> {
+  const r = await q.query<T>(sql, params)
+  return r.rows[0] ?? null
+}
+export async function all<T>(q: Queryable, sql: string, params: unknown[] = []): Promise<T[]> {
+  return (await q.query<T>(sql, params)).rows
+}
+
+export interface OpenDbOptions {
+  databaseUrl?: string | null
+  /** PGlite のデータディレクトリ。':memory:' または未指定でインメモリ */
+  pgliteDir?: string | null
+  /** Vercel Fluid compute で Pool を再利用するためのフック */
+  attachPool?: boolean
+}
+
+export async function openDb(opts: OpenDbOptions): Promise<Db> {
+  const db = opts.databaseUrl ? await openPg(opts.databaseUrl, opts.attachPool ?? false) : await openPglite(opts.pgliteDir ?? null)
+  return db
+}
+
+async function openPg(connectionString: string, attach: boolean): Promise<Db> {
+  const { default: pg } = await import('pg')
+  const pool = new pg.Pool({ connectionString, max: 5, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 10_000 })
+  if (attach) {
+    try {
+      const { attachDatabasePool } = await import('@vercel/functions')
+      attachDatabasePool(pool)
+    } catch {
+      /* @vercel/functions が無い環境では無視 */
+    }
+  }
+  const db: Db = {
+    kind: 'pg',
+    query: <T>(sql: string, params: unknown[] = []) => pool.query(sql, params as never[]) as unknown as Promise<QueryResult<T>>,
+    exec: async (sql) => {
+      await pool.query(sql)
+    },
+    async tx(fn) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const r = await fn({
+          query: <T>(sql: string, params: unknown[] = []) => client.query(sql, params as never[]) as unknown as Promise<QueryResult<T>>,
+          exec: async (sql) => {
+            await client.query(sql)
+          },
+        })
+        await client.query('COMMIT')
+        return r
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {})
+        throw e
+      } finally {
+        client.release()
+      }
+    },
+    migrate: () => runMigrations(db),
+    close: () => pool.end(),
+  }
+  return db
+}
+
+async function openPglite(dir: string | null): Promise<Db> {
+  const { PGlite } = await import('@electric-sql/pglite')
+  const inMemory = !dir || dir === ':memory:'
+  if (!inMemory) fs.mkdirSync(dir!, { recursive: true })
+  const pg = inMemory ? await PGlite.create() : await PGlite.create({ dataDir: dir! })
+  const db: Db = {
+    kind: 'pglite',
+    query: <T>(sql: string, params: unknown[] = []) => pg.query(sql, params as never[]) as unknown as Promise<QueryResult<T>>,
+    exec: async (sql) => {
+      await pg.exec(sql)
+    },
+    tx: (fn) =>
+      pg.transaction((t) =>
+        fn({
+          query: <T>(sql: string, params: unknown[] = []) => t.query(sql, params as never[]) as unknown as Promise<QueryResult<T>>,
+          exec: async (sql) => {
+            await t.exec(sql)
+          },
+        }),
+      ),
+    migrate: () => runMigrations(db),
+    close: () => pg.close(),
+  }
+  return db
+}
+
+export const migrationsDir = path.join(repoRoot, 'server', 'migrations')
+
+/** server/migrations/*.sql を名前順に適用する（schema_migrations で管理） */
+export async function runMigrations(db: Db): Promise<string[]> {
+  await db.query('CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)')
+  const applied = new Set((await all<{ name: string }>(db, 'SELECT name FROM schema_migrations')).map((r) => r.name))
+  const files = fs
+    .readdirSync(migrationsDir)
+    .filter((f) => f.endsWith('.sql'))
+    .sort()
+  const done: string[] = []
+  for (const f of files) {
+    if (applied.has(f)) continue
+    const sql = fs.readFileSync(path.join(migrationsDir, f), 'utf8')
+    await db.tx(async (q) => {
+      await q.exec(sql)
+      await q.query('INSERT INTO schema_migrations (name, applied_at) VALUES ($1, $2)', [f, nowIso()])
+    })
+    done.push(f)
+  }
+  return done
+}
+
+/** テスト用: 全テーブルを空にする */
+export async function truncateAll(db: Db) {
+  await db.exec('TRUNCATE TABLE analytics_events, publish_events, scene_versions, assets, projects, sessions, users, login_locks, rate_limits RESTART IDENTITY CASCADE')
+}

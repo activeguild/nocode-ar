@@ -10,3 +10,4 @@ e2e/.fixtures/
 e2e/.out/
 .env
 .DS_Store
+.vercel/

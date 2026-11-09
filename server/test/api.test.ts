@@ -1,16 +1,21 @@
 import request from 'supertest'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { emptyScene, type Scene } from '../../shared/src/index.ts'
-import { tinyGlb, tinyJpeg, tinyJpegHeader, tinyMind, tinyMp4, tinyPng } from './fixtures.ts'
-import { makeTestApp } from './helpers.ts'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { emptyScene, type Scene } from '../../shared/src/index.js'
+import { tinyGlb, tinyJpeg, tinyJpegHeader, tinyMind, tinyMp4, tinyPng } from './fixtures.js'
+import { closeSharedDb, makeTestApp } from './helpers.js'
 
-type App = ReturnType<typeof makeTestApp>
+type App = Awaited<ReturnType<typeof makeTestApp>>
 
 let t: App
-beforeEach(() => {
-  t = makeTestApp()
+beforeEach(async () => {
+  t = await makeTestApp()
 })
 afterEach(() => t.cleanup())
+afterAll(() => closeSharedDb())
+
+async function count(sql: string, params: unknown[]): Promise<number> {
+  return Number((await t.db.query<{ n: unknown }>(sql, params)).rows[0].n)
+}
 
 async function signup(email = 'sato@example.com', password = 'password123') {
   const res = await request(t.app).post('/api/auth/signup').send({ email, password })
@@ -308,9 +313,9 @@ describe('計測（FR-7-6, FR-9, NFR-6）', () => {
     expect(tap.buttonId).toBe('b1')
     expect(tap.os).toBe('ios')
 
-    const cols = t.db.prepare('PRAGMA table_info(analytics_events)').all() as { name: string }[]
-    expect(cols.map((c) => c.name)).not.toContain('ip')
-    expect(cols.map((c) => c.name)).not.toContain('user_agent')
+    const cols = (await t.db.query<{ column_name: string }>("SELECT column_name FROM information_schema.columns WHERE table_name = 'analytics_events'")).rows.map((c) => c.column_name)
+    expect(cols).not.toContain('ip')
+    expect(cols).not.toContain('user_agent')
 
     const list = await request(t.app).get('/api/projects').set('Cookie', cookie)
     expect(list.body.projects[0].totals).toEqual({ viewStart: 1, ctaTap: 1 })
@@ -358,7 +363,7 @@ describe('QA 曖昧点の確定仕様（Q1, Q2, Q4）', () => {
     expect((await request(t.app).get(`/api/projects/${p.id}`).set('Cookie', cookie)).status).toBe(404)
     expect((await request(t.app).get(`/api/preview/${p.previewToken}`)).status).toBe(404)
     // 素材ファイルは削除される
-    expect(t.db.prepare('SELECT COUNT(*) AS n FROM assets WHERE project_id = ?').get(p.id)).toEqual({ n: 0 })
+    expect(await count('SELECT COUNT(*) AS n FROM assets WHERE project_id = $1', [p.id])).toBe(0)
   })
 
   it('Q2: 再開は停止前の公開版に戻し、下書きは反映しない（type = resume）', async () => {
@@ -378,21 +383,33 @@ describe('QA 曖昧点の確定仕様（Q1, Q2, Q4）', () => {
     expect((await request(t.app).post(`/api/projects/${p.id}/resume`).set('Cookie', cookie)).status).toBe(400)
   })
 
-  it('Q4: 下書きにも公開版にも参照されない古い素材は自動削除される', async () => {
+  it('Q4: 下書きにも公開版にも参照されない古い素材は掃除（/api/cron/cleanup）で削除される', async () => {
+    t.cleanup()
+    t = await makeTestApp({}, 'memory')
     const cookie = await signup()
     const p = await createProject(cookie)
     const scene = await makeReady(cookie, p.id)
     const old = await upload(cookie, p.id, 'overlay', tinyGlb())
     expect(old.status).toBe(201)
     // 猶予時間（15 分）内は削除されない
-    await request(t.app).patch(`/api/projects/${p.id}`).set('Cookie', cookie).send({ draftScene: scene })
-    expect(t.db.prepare('SELECT COUNT(*) AS n FROM assets WHERE id = ?').get(old.body.asset.id)).toEqual({ n: 1 })
+    const cron = () => request(t.app).get('/api/cron/cleanup').set('Authorization', 'Bearer test-cron-secret')
+    expect((await request(t.app).get('/api/cron/cleanup')).status).toBe(401)
+    let r = await cron()
+    expect(r.status).toBe(200)
+    expect(r.body.assetsDeleted).toBe(0)
+    expect(await count('SELECT COUNT(*) AS n FROM assets WHERE id = $1', [old.body.asset.id])).toBe(1)
     // 古い素材として扱わせる
-    t.db.prepare('UPDATE assets SET created_at = ? WHERE id = ?').run('2000-01-01T00:00:00.000Z', old.body.asset.id)
-    await request(t.app).patch(`/api/projects/${p.id}`).set('Cookie', cookie).send({ draftScene: scene })
-    expect(t.db.prepare('SELECT COUNT(*) AS n FROM assets WHERE id = ?').get(old.body.asset.id)).toEqual({ n: 0 })
+    await t.db.query('UPDATE assets SET created_at = $1 WHERE id = $2', ['2000-01-01T00:00:00.000Z', old.body.asset.id])
+    r = await cron()
+    expect(r.body.assetsDeleted).toBe(1)
+    expect(await count('SELECT COUNT(*) AS n FROM assets WHERE id = $1', [old.body.asset.id])).toBe(0)
+    expect(t.storage.objects!.has(`projects/${p.id}/overlay/${old.body.asset.id}.glb`)).toBe(false)
     // 参照中の素材は残る
-    expect(t.db.prepare('SELECT COUNT(*) AS n FROM assets WHERE id = ?').get(scene.overlay!.assetId)).toEqual({ n: 1 })
+    expect(await count('SELECT COUNT(*) AS n FROM assets WHERE id = $1', [scene.overlay!.assetId])).toBe(1)
+    // 迷子の Blob（DB に無い）も掃除される
+    await t.storage.put(`projects/${p.id}/overlay/orphan.png`, tinyPng(), 'image/png')
+    r = await cron()
+    expect(r.body.orphanBlobsDeleted).toBe(1)
   })
 })
 
@@ -430,12 +447,12 @@ describe('QA ラウンド 1 の修正（D-01〜D-22）', () => {
     expect((await send({ type: 'cta_tap', buttonId: 'b1', os: 'ios' })).status).toBe(204)
     // 万一 DB に危険な値があっても CSV セルは ' で無害化される
     const today = new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10)
-    t.db.prepare("INSERT INTO analytics_events (project_id, scene_version_id, type, button_id, os, occurred_at, day_jst) VALUES (?, NULL, 'cta_tap', ?, 'ios', ?, ?)").run(
+    await t.db.query("INSERT INTO analytics_events (project_id, scene_version_id, type, button_id, os, occurred_at, day_jst) VALUES ($1, NULL, 'cta_tap', $2, 'ios', $3, $4)", [
       p.id,
       '=HYPERLINK("x")',
       new Date().toISOString(),
       today,
-    )
+    ])
     const csv = await request(t.app).get(`/api/projects/${p.id}/stats.csv?from=${today}&to=${today}`).set('Cookie', cookie)
     expect(csv.text).toContain(`"'=HYPERLINK(""x"")"`)
     expect(csv.text).not.toMatch(/,"=/)
@@ -460,7 +477,7 @@ describe('QA ラウンド 1 の修正（D-01〜D-22）', () => {
 
   it('D-06: アカウント合計の上限を超えると 413', async () => {
     t.cleanup()
-    t = makeTestApp({ accountQuotaBytes: 1500 })
+    t = await makeTestApp({ accountQuotaBytes: 1500 })
     const cookie = await signup()
     const p1 = await createProject(cookie)
     const p2 = await createProject(cookie, '2 本目')
@@ -518,5 +535,63 @@ describe('QA ラウンド 1 の修正（D-01〜D-22）', () => {
     } finally {
       spy.mockRestore()
     }
+  })
+})
+
+describe('Vercel 構成（Blob 直接アップロードの登録、Cron、健全性）', () => {
+  it('/assets/register: 所有権・形式・寸法・上限をサーバが検証し、不正な Blob は削除する', async () => {
+    t.cleanup()
+    t = await makeTestApp({}, 'memory')
+    const cookie = await signup()
+    const p = await createProject(cookie)
+    const other = await createProject(cookie, '別プロジェクト')
+    // クライアントが Blob に置いた想定で memory storage に直接オブジェクトを置く
+    const put = (key: string, body: Buffer, type: string) => t.storage.put(key, body, type)
+    const okPng = await put(`projects/${p.id}/target_image/a1.png`, tinyPng(300, 200), 'image/png')
+    const reg = await request(t.app).post(`/api/projects/${p.id}/assets/register`).set('Cookie', cookie).send({ kind: 'target_image', url: okPng.url, pathname: okPng.key, width: 1, height: 1 })
+    expect(reg.status).toBe(201)
+    expect(reg.body.asset).toMatchObject({ mime: 'image/png', width: 300, height: 200, url: okPng.url })
+
+    // 他プロジェクトのパス（所有権違反）
+    const foreign = await put(`projects/${other.id}/overlay/x.png`, tinyPng(), 'image/png')
+    expect((await request(t.app).post(`/api/projects/${p.id}/assets/register`).set('Cookie', cookie).send({ kind: 'overlay', url: foreign.url, pathname: foreign.key })).status).toBe(400)
+    // kind とパスの不一致
+    expect((await request(t.app).post(`/api/projects/${p.id}/assets/register`).set('Cookie', cookie).send({ kind: 'overlay', url: okPng.url, pathname: okPng.key })).status).toBe(400)
+    // 形式不正（HTML を PNG として登録）→ 400 かつ Blob 削除
+    const bad = await put(`projects/${p.id}/overlay/bad.png`, Buffer.from('<html>not an image at all</html>'), 'image/png')
+    const badRes = await request(t.app).post(`/api/projects/${p.id}/assets/register`).set('Cookie', cookie).send({ kind: 'overlay', url: bad.url, pathname: bad.key })
+    expect(badRes.status).toBe(400)
+    expect(t.storage.objects!.has(bad.key)).toBe(false)
+    // MOV → R5 文言
+    const mov = await put(`projects/${p.id}/overlay/v.mov`, tinyMp4('qt  '), 'video/quicktime')
+    const movRes = await request(t.app).post(`/api/projects/${p.id}/assets/register`).set('Cookie', cookie).send({ kind: 'overlay', url: mov.url, pathname: mov.key })
+    expect(movRes.body.code).toBe('mov')
+    // 存在しない URL
+    expect((await request(t.app).post(`/api/projects/${p.id}/assets/register`).set('Cookie', cookie).send({ kind: 'overlay', url: 'memory://store/projects/' + p.id + '/overlay/none.png', pathname: `projects/${p.id}/overlay/none.png` })).status).toBe(400)
+    // .mind
+    const mind = await put(`projects/${p.id}/target_mind/t.mind`, tinyMind(10), 'application/octet-stream')
+    expect((await request(t.app).post(`/api/projects/${p.id}/assets/register`).set('Cookie', cookie).send({ kind: 'target_mind', url: mind.url, pathname: mind.key })).status).toBe(201)
+  })
+
+  it('/api/config は uploadMode を返し、ストレージが local のときは register を使わせない', async () => {
+    const cfg = await request(t.app).get('/api/config')
+    expect(cfg.body.uploadMode).toBe('direct')
+    const health = await request(t.app).get('/healthz')
+    expect(health.body).toMatchObject({ ok: true, db: 'pglite', storage: 'local' })
+  })
+
+  it('ログインロックとレート制限が DB に保持される（プロセス再起動相当で別 app でも継続）', async () => {
+    await signup()
+    for (let i = 0; i < 10; i++) await request(t.app).post('/api/auth/login').send({ email: 'sato@example.com', password: 'wrong-password' })
+    const locks = await count('SELECT COUNT(*) AS n FROM login_locks WHERE email = $1', ['sato@example.com'])
+    expect(locks).toBe(1)
+    // 同じ DB を使う別インスタンス（サーバレスの別実行を模す）でもロックが効く
+    const { createApp } = await import('../src/app.js')
+    const app2 = createApp({ db: t.db, storage: t.storage, config: t.config })
+    expect((await request(app2).post('/api/auth/login').send({ email: 'sato@example.com', password: 'password123' })).status).toBe(429)
+    const p = await createProject((await request(t.app).post('/api/auth/signup').send({ email: 'b@example.com', password: 'password123' })).headers['set-cookie'][0].split(';')[0])
+    for (let i = 0; i < 60; i++) await request(t.app).post(`/api/public/${p.slug}/events`).send({ type: 'page_open', os: 'other' })
+    expect((await request(app2).post(`/api/public/${p.slug}/events`).send({ type: 'page_open', os: 'other' })).status).toBe(429)
+    expect(await count('SELECT COUNT(*) AS n FROM rate_limits', [])).toBe(1)
   })
 })

@@ -7,8 +7,6 @@
     "types": ["node"],
     "strict": true,
     "esModuleInterop": true,
-    "allowImportingTsExtensions": true,
-    "rewriteRelativeImportExtensions": true,
     "skipLibCheck": true,
     "noEmit": true,
     "rootDir": "..",

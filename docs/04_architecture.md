@@ -232,3 +232,69 @@ WebAR の技術選定は、ライブラリより先に **iOS と Android のブ�
 実測（ビルド、gzip）: viewer 4.3 KB + 共通チャンク 166 KB + three 82 KB = 約 254 KB（導入画面まで）、カメラ起動時に MindAR 48 KB + TF.js 含む controller 290 KB = 約 338 KB を追加読み込み。ターゲット画像の `.mind` 生成はヘッドレス Chromium（ソフトウェア描画）で 512×640 画像が約 6 秒。
 
 将来の置き換え: SQLite → PostgreSQL（`server/src/projects.ts` の SQL を差し替え）、ローカル素材 → S3 / R2（`server/src/assets.ts` の保存・`/a/:name` 配信を差し替え）、MindAR → フォーク版（`web/src/viewer/ar.ts` と `compile.ts` のみが依存）。
+
+---
+
+## Vercel 構成（2026-11-09、オーナー判断による載せ替え）
+
+### 全体図
+
+```
+ [作成者のブラウザ]                        [体験者のスマホ]
+   作成画面 (index.html)                    閲覧ページ (viewer.html)
+      │ /api/*  (JSON)                         │ /api/public/:slug, /api/public/:slug/events
+      │ 素材: @vercel/blob/client で直接 PUT    │ 素材: Blob の公開 URL から直接 GET
+      ▼                                        ▼
+ ┌──────────────────────────── Vercel ────────────────────────────┐
+ │ CDN / 静的配信: web/dist（index.html, viewer.html, assets/*）  │
+ │   rewrites: /v/:slug,/p/:token → viewer.html, その他 → index   │
+ │ Function: api/index.ts（Express 1 本）                          │
+ │   /api/*, /a/*（ローカル配信用、Vercel では未使用）, /healthz   │
+ │ Cron: 0 3 * * * → GET /api/cron/cleanup (Bearer CRON_SECRET)  │
+ └───────────┬──────────────────────────┬────────────────────────┘
+             │ pg Pool（attachDatabasePool）│ @vercel/blob（put/del/list/HEAD/Range）
+             ▼                              ▼
+      Neon PostgreSQL                   Vercel Blob（public, addRandomSuffix）
+      users / sessions / projects /     projects/<projectId>/<kind>/<name>-<random>.<ext>
+      assets / scene_versions /
+      publish_events / analytics_events /
+      login_locks / rate_limits
+```
+
+### 実装の要点
+
+| 項目 | 内容 |
+| --- | --- |
+| Function | `api/index.ts` → `server/src/vercel.ts`。コールドスタート時に 1 回だけ DB 接続・アプリ生成（`getRuntime()`）。`vercel.json` で `maxDuration: 30`, `memory: 1024`。本文上限 4.5 MB のため大きな素材は Blob 直接アップロード |
+| DB アダプタ | `server/src/db.ts`。`DATABASE_URL` があれば `pg`（Pool max 5。Vercel では `@vercel/functions` の `attachDatabasePool` で Fluid compute の接続再利用）、無ければ `@electric-sql/pglite`（ローカル: `data/pglite`、テスト: インメモリ）。同じ SQL（`$1` プレースホルダ）で動く。pg は COUNT/SUM を文字列で返すため `num()` で数値化 |
+| マイグレーション | `server/migrations/*.sql` を `schema_migrations` で管理。`npm run migrate`（PGlite は起動時に自動、PostgreSQL は `AUTO_MIGRATE=1` のときのみ自動） |
+| プロセス内状態の排除 | ログインロック → `login_locks`、レート制限（slug ごと 60/分）→ `rate_limits`（`INSERT ... ON CONFLICT` で原子的に加算）、セッションは従来どおり `sessions` |
+| 素材ストレージ | `server/src/storage.ts` の `Storage` アダプタ（`put / delete / head / readRange / list`）。`local`（ファイル、`/a/<id>.<ext>` で配信）/ `blob`（Vercel Blob）/ `memory`（テスト）。`BLOB_READ_WRITE_TOKEN` の有無で切替 |
+| アップロード | ブラウザ → `POST /api/projects/:id/blob-upload`（`handleUpload`: 所有者・kind・`projects/<id>/<kind>/` パス・`maximumSizeInBytes`・`allowedContentTypes`・`addRandomSuffix` を検証してトークン発行）→ Blob へ直接 PUT（8 MB 超は multipart）→ `POST /api/projects/:id/assets/register`（先頭 64 KB をレンジ取得してマジックバイト・寸法・上限・容量を検証。失敗時は Blob を削除）。完了 Webhook（`onUploadCompleted`）はローカルで届かないため使わない。登録前に離脱した Blob は Cron の掃除で削除 |
+| D-01 の維持 | 公開 API は公開版が参照する素材の URL のみ返す。Blob URL は `addRandomSuffix` で推測不能 |
+| 圧縮 | Vercel CDN が gzip / brotli を自動適用（Functions の応答も対象）。`isVercel` のとき Express の `compression` は無効 |
+| 掃除（Q4） | `GET /api/cron/cleanup`（`CRON_SECRET`）。未参照素材（15 分猶予）、DB に無い Blob、期限切れセッション、古いロック / レート制限行。常駐時は 15 分間隔の `setInterval` でも実行 |
+| 静的配信 | `outputDirectory: web/dist`。Vercel は filesystem を先に見るため、`/assets/*` 等の実ファイルは rewrites より優先される |
+
+### 環境変数
+
+| 変数 | 必須 | 設定元 |
+| --- | --- | --- |
+| `DATABASE_URL` | 必須 | Neon 連携で自動（pooled 接続文字列） |
+| `BLOB_READ_WRITE_TOKEN` | 必須 | Blob ストア接続で自動 |
+| `CRON_SECRET` | 必須 | 手動（ランダム文字列） |
+| `PUBLIC_ORIGIN` | 推奨 | 手動（独自ドメイン）。未設定時は `X-Forwarded-Host` から組み立てる |
+| `SERVICE_NAME` / `SUPPORT_EMAIL` / `ACCOUNT_QUOTA_BYTES` / `AUTO_MIGRATE` | 任意 | 手動 |
+| `VERCEL` | 自動 | Vercel が付与（`isVercel` の判定に使用） |
+
+### コスト上の注意
+
+- **Blob の帯域**: 閲覧者は素材（動画 50 MB まで）を Blob から直接取得するため、体験回数 × 素材サイズがそのまま Blob の転送量になる。動画は 1080p / 30 秒以内を推奨（R7 の注意表示）。Blob のキャッシュ（既定 `cacheControlMaxAge` 1 か月）は効くが、初回取得は課金対象。
+- **Function の実行時間**: 1 リクエストは数十 ms〜数百 ms。`/assets/register` は Blob への HEAD + Range GET を含むため 1 秒前後。Cron の掃除は素材数に比例（`maxDuration` 30 秒以内に収まる想定。超える規模になったらページングを入れる）。
+- **Neon**: 接続は Pool 最大 5 / 関数インスタンス。Fluid compute で再利用される。Neon の無料枠はコンピュート時間に上限があるため、計測イベントの書き込み頻度が高い場合は有料プランを検討。
+- **Hobby プランの制約**: Cron は 1 日 1 回まで（既定の `0 3 * * *`）。関数の `maxDuration` 上限など。Pro で毎時に変更可。
+
+### 本環境で確認できたこと / できなかったこと
+
+- 確認済み: `npx vercel build`（ダミーの `.vercel/project.json`）で `.vercel/output` に `functions/api/index.func` と `static/` が生成され、ルーティング（`config.json`）が期待どおり。コンパイル済み関数を Node で直接呼び出し、PGlite + ローカル素材で `/healthz` `/api/config` `/api/auth/signup` が動作。
+- 未確認（実デプロイが必要）: Neon への接続、Blob の実アップロード（`handleUpload` のトークン発行とクライアント PUT）、Range GET の挙動、Cron の実行、CDN 圧縮の実測。

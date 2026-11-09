@@ -35,7 +35,7 @@ const server = spawn(process.execPath, ['server/dist/server/src/index.js'], {
 server.stdout.on('data', (d) => process.stdout.write(`[server] ${d}`))
 
 const base = `http://127.0.0.1:${port}`
-for (let i = 0; i < 50; i++) {
+for (let i = 0; i < 150; i++) {
   try {
     const r = await fetch(`${base}/healthz`)
     if (r.ok) break

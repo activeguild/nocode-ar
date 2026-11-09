@@ -1,1 +1,1 @@
-export * from './scene.ts'
+export * from './scene.js'

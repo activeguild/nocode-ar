@@ -15,12 +15,14 @@
     "test": "npm run test -w server",
     "e2e": "node scripts/e2e.mjs",
     "fixtures": "node scripts/gen-fixtures.mjs",
-    "reset-password": "npm run reset-password -w server --"
+    "reset-password": "npm run reset-password -w server --",
+    "migrate": "npm run migrate -w server --",
+    "vercel-build": "npm run build -w web"
   },
   "overrides": {
     "canvas": "npm:empty-npm-package@1.0.0"
   },
   "engines": {
-    "node": ">=22"
+    "node": "22.x"
   }
 }

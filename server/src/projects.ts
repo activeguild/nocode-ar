@@ -1,8 +1,9 @@
-import { emptyScene, sceneSchema, type ProjectStatus, type Scene } from '../../shared/src/index.ts'
-import { deleteAssetFile, listAssets, toAssetInfo } from './assets.ts'
-import type { Db } from './db.ts'
-import { nowIso } from './db.ts'
-import { newId, newSlug, newToken } from './ids.ts'
+import { emptyScene, sceneSchema, type ProjectStatus, type Scene } from '../../shared/src/index.js'
+import { deleteAsset, listAssets, toAssetInfo, type AssetRow } from './assets.js'
+import type { Db, Queryable } from './db.js'
+import { all, nowIso, num, one } from './db.js'
+import { newId, newSlug, newToken } from './ids.js'
+import type { Storage } from './storage.js'
 
 export interface ProjectRow {
   id: string
@@ -29,13 +30,13 @@ export interface ProjectSummary {
   totals: { viewStart: number; ctaTap: number }
 }
 
-export function toSummary(db: Db, p: ProjectRow): ProjectSummary {
-  const t = db
-    .prepare(
-      `SELECT SUM(CASE WHEN type = 'view_start' THEN 1 ELSE 0 END) AS v, SUM(CASE WHEN type = 'cta_tap' THEN 1 ELSE 0 END) AS c
-       FROM analytics_events WHERE project_id = ?`,
-    )
-    .get(p.id) as { v: number | null; c: number | null }
+export async function toSummary(db: Queryable, p: ProjectRow): Promise<ProjectSummary> {
+  const t = await one<{ v: unknown; c: unknown }>(
+    db,
+    `SELECT SUM(CASE WHEN type = 'view_start' THEN 1 ELSE 0 END) AS v, SUM(CASE WHEN type = 'cta_tap' THEN 1 ELSE 0 END) AS c
+     FROM analytics_events WHERE project_id = $1`,
+    [p.id],
+  )
   return {
     id: p.id,
     name: p.name,
@@ -45,7 +46,7 @@ export function toSummary(db: Db, p: ProjectRow): ProjectSummary {
     publishedSceneId: p.published_scene_id,
     createdAt: p.created_at,
     updatedAt: p.updated_at,
-    totals: { viewStart: t.v ?? 0, ctaTap: t.c ?? 0 },
+    totals: { viewStart: num(t?.v), ctaTap: num(t?.c) },
   }
 }
 
@@ -54,23 +55,17 @@ export function parseScene(json: string): Scene {
   return r.success ? r.data : emptyScene()
 }
 
-export function listProjects(db: Db, userId: string): ProjectRow[] {
-  return db.prepare("SELECT * FROM projects WHERE user_id = ? AND status <> 'deleted' ORDER BY updated_at DESC").all(userId) as ProjectRow[]
-}
+export const listProjects = (db: Queryable, userId: string) =>
+  all<ProjectRow>(db, "SELECT * FROM projects WHERE user_id = $1 AND status <> 'deleted' ORDER BY updated_at DESC", [userId])
 
-export function getProject(db: Db, userId: string, id: string): ProjectRow | null {
-  return (db.prepare("SELECT * FROM projects WHERE id = ? AND user_id = ? AND status <> 'deleted'").get(id, userId) as ProjectRow | undefined) ?? null
-}
+export const getProject = (db: Queryable, userId: string, id: string) =>
+  one<ProjectRow>(db, "SELECT * FROM projects WHERE id = $1 AND user_id = $2 AND status <> 'deleted'", [id, userId])
 
-export function getProjectBySlug(db: Db, slug: string): ProjectRow | null {
-  return (db.prepare('SELECT * FROM projects WHERE slug = ?').get(slug) as ProjectRow | undefined) ?? null
-}
+export const getProjectBySlug = (db: Queryable, slug: string) => one<ProjectRow>(db, 'SELECT * FROM projects WHERE slug = $1', [slug])
 
-export function getProjectByPreviewToken(db: Db, token: string): ProjectRow | null {
-  return (db.prepare('SELECT * FROM projects WHERE preview_token = ?').get(token) as ProjectRow | undefined) ?? null
-}
+export const getProjectByPreviewToken = (db: Queryable, token: string) => one<ProjectRow>(db, 'SELECT * FROM projects WHERE preview_token = $1', [token])
 
-export function createProject(db: Db, userId: string, name: string): ProjectRow {
+export async function createProject(db: Db, userId: string, name: string): Promise<ProjectRow> {
   const now = nowIso()
   for (let attempt = 0; attempt < 5; attempt++) {
     const row: ProjectRow = {
@@ -86,10 +81,11 @@ export function createProject(db: Db, userId: string, name: string): ProjectRow 
       updated_at: now,
     }
     try {
-      db.prepare(
+      await db.query(
         `INSERT INTO projects (id, user_id, name, slug, status, preview_token, draft_scene, published_scene_id, created_at, updated_at)
-         VALUES (@id, @user_id, @name, @slug, @status, @preview_token, @draft_scene, @published_scene_id, @created_at, @updated_at)`,
-      ).run(row)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [row.id, row.user_id, row.name, row.slug, row.status, row.preview_token, row.draft_scene, row.published_scene_id, row.created_at, row.updated_at],
+      )
       return row
     } catch (e) {
       if (attempt === 4) throw e // slug 衝突のリトライ
@@ -98,64 +94,34 @@ export function createProject(db: Db, userId: string, name: string): ProjectRow 
   throw new Error('unreachable')
 }
 
-export function updateProject(db: Db, id: string, patch: { name?: string; draftScene?: Scene }) {
-  const sets: string[] = ['updated_at = @updated_at']
-  const params: Record<string, unknown> = { id, updated_at: nowIso() }
+export async function updateProject(db: Queryable, id: string, patch: { name?: string; draftScene?: Scene }) {
+  const sets: string[] = ['updated_at = $2']
+  const params: unknown[] = [id, nowIso()]
   if (patch.name !== undefined) {
-    sets.push('name = @name')
-    params.name = patch.name
+    params.push(patch.name)
+    sets.push(`name = $${params.length}`)
   }
   if (patch.draftScene !== undefined) {
-    sets.push('draft_scene = @draft_scene')
-    params.draft_scene = JSON.stringify(patch.draftScene)
+    params.push(JSON.stringify(patch.draftScene))
+    sets.push(`draft_scene = $${params.length}`)
   }
-  db.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = @id`).run(params)
+  await db.query(`UPDATE projects SET ${sets.join(', ')} WHERE id = $1`, params)
 }
 
 /**
- * Q1: 削除は論理削除。slug と公開履歴（終了画面のボタン・案内 URL に使う）は残し、素材ファイルは削除する。
- * 削除後に公開 URL を開くと「終了しました」画面（R1 の案内つき）になる。
+ * Q1: 削除は論理削除。slug と公開履歴（終了画面のボタン・案内 URL に使う）は残し、素材は削除する。
  */
-export function deleteProject(db: Db, dataDir: string, p: ProjectRow) {
-  for (const a of listAssets(db, p.id)) deleteAssetFile(dataDir, a)
-  const tx = db.transaction(() => {
-    db.prepare('DELETE FROM assets WHERE project_id = ?').run(p.id)
-    db.prepare("UPDATE projects SET status = 'deleted', draft_scene = ?, preview_token = ?, updated_at = ? WHERE id = ?").run(
-      JSON.stringify(emptyScene()),
-      newToken(),
-      nowIso(),
-      p.id,
-    )
-    db.prepare('INSERT INTO publish_events (project_id, type, scene_version_id, at) VALUES (?, ?, ?, ?)').run(p.id, 'delete', p.published_scene_id, nowIso())
+export async function deleteProject(db: Db, storage: Storage, p: ProjectRow) {
+  for (const a of await listAssets(db, p.id)) await deleteAsset(db, storage, a)
+  await db.tx(async (q) => {
+    await q.query("UPDATE projects SET status = 'deleted', draft_scene = $2, preview_token = $3, updated_at = $4 WHERE id = $1", [p.id, JSON.stringify(emptyScene()), newToken(), nowIso()])
+    await q.query('INSERT INTO publish_events (project_id, type, scene_version_id, at) VALUES ($1, $2, $3, $4)', [p.id, 'delete', p.published_scene_id, nowIso()])
   })
-  tx()
 }
 
-/**
- * Q4: 下書きにも公開版にも参照されていない素材を削除する（差し替え前の旧素材の自動整理）。
- * アップロード直後〜下書き保存までの競合を避けるため、作成から GRACE 以内の素材は対象外。
- */
-const CLEANUP_GRACE_MS = 15 * 60_000
-export function cleanupUnreferencedAssets(db: Db, dataDir: string, p: ProjectRow): number {
-  const keep = publishedAssetIds(db, p)
-  const d = parseScene(p.draft_scene)
-  for (const id of [d.target.imageAssetId, d.target.mindAssetId, d.overlay?.assetId, d.overlay?.thumbnailAssetId]) if (id) keep.add(id)
-  let n = 0
-  const cutoff = new Date(Date.now() - CLEANUP_GRACE_MS).toISOString()
-  for (const a of listAssets(db, p.id)) {
-    if (keep.has(a.id)) continue
-    const createdAt = (db.prepare('SELECT created_at FROM assets WHERE id = ?').get(a.id) as { created_at: string }).created_at
-    if (createdAt > cutoff) continue
-    db.prepare('DELETE FROM assets WHERE id = ?').run(a.id)
-    deleteAssetFile(dataDir, a)
-    n++
-  }
-  return n
-}
-
-export function rotatePreviewToken(db: Db, id: string): string {
+export async function rotatePreviewToken(db: Queryable, id: string): Promise<string> {
   const t = newToken()
-  db.prepare('UPDATE projects SET preview_token = ?, updated_at = ? WHERE id = ?').run(t, nowIso(), id)
+  await db.query('UPDATE projects SET preview_token = $2, updated_at = $3 WHERE id = $1', [id, t, nowIso()])
   return t
 }
 
@@ -167,52 +133,46 @@ export interface SceneVersionRow {
   published_by_user_id: string
 }
 
-export function getSceneVersion(db: Db, id: string): SceneVersionRow | null {
-  return (db.prepare('SELECT * FROM scene_versions WHERE id = ?').get(id) as SceneVersionRow | undefined) ?? null
-}
+export const getSceneVersion = (db: Queryable, id: string) => one<SceneVersionRow>(db, 'SELECT * FROM scene_versions WHERE id = $1', [id])
 
 /** FR-6-3 / FR-6-7: 下書きのスナップショットを公開版にする。NFR-5: 10 世代保持 */
-export function publishProject(db: Db, p: ProjectRow, userId: string): SceneVersionRow {
-  // 停止中からの「公開」は下書きの再公開（republish）。停止前の公開版に戻すだけなら resumeProject
+export async function publishProject(db: Db, p: ProjectRow, userId: string): Promise<SceneVersionRow> {
   const now = nowIso()
   const version: SceneVersionRow = { id: newId(), project_id: p.id, scene: p.draft_scene, published_at: now, published_by_user_id: userId }
-  const tx = db.transaction(() => {
-    db.prepare(
-      'INSERT INTO scene_versions (id, project_id, scene, published_at, published_by_user_id) VALUES (@id, @project_id, @scene, @published_at, @published_by_user_id)',
-    ).run(version)
-    db.prepare("UPDATE projects SET status = 'published', published_scene_id = ?, updated_at = ? WHERE id = ?").run(version.id, now, p.id)
-    db.prepare('INSERT INTO publish_events (project_id, type, scene_version_id, at) VALUES (?, ?, ?, ?)').run(
-      p.id,
-      p.published_scene_id ? 'republish' : 'publish',
+  await db.tx(async (q) => {
+    await q.query('INSERT INTO scene_versions (id, project_id, scene, published_at, published_by_user_id) VALUES ($1, $2, $3, $4, $5)', [
       version.id,
-      now,
+      version.project_id,
+      version.scene,
+      version.published_at,
+      version.published_by_user_id,
+    ])
+    await q.query("UPDATE projects SET status = 'published', published_scene_id = $2, updated_at = $3 WHERE id = $1", [p.id, version.id, now])
+    await q.query('INSERT INTO publish_events (project_id, type, scene_version_id, at) VALUES ($1, $2, $3, $4)', [p.id, p.published_scene_id ? 'republish' : 'publish', version.id, now])
+    await q.query(
+      `DELETE FROM scene_versions WHERE project_id = $1 AND id NOT IN (
+         SELECT id FROM scene_versions WHERE project_id = $1 ORDER BY published_at DESC LIMIT 10)`,
+      [p.id],
     )
-    db.prepare(
-      `DELETE FROM scene_versions WHERE project_id = ? AND id NOT IN (
-         SELECT id FROM scene_versions WHERE project_id = ? ORDER BY published_at DESC LIMIT 10)`,
-    ).run(p.id, p.id)
   })
-  tx()
   return version
 }
 
 /** Q2: 再開は停止前の公開版にそのまま戻す（下書きは反映しない）。PublishEvent.type = 'resume' */
-export function resumeProject(db: Db, p: ProjectRow) {
+export async function resumeProject(db: Db, p: ProjectRow) {
   const now = nowIso()
-  const tx = db.transaction(() => {
-    db.prepare("UPDATE projects SET status = 'published', updated_at = ? WHERE id = ?").run(now, p.id)
-    db.prepare('INSERT INTO publish_events (project_id, type, scene_version_id, at) VALUES (?, ?, ?, ?)').run(p.id, 'resume', p.published_scene_id, now)
+  await db.tx(async (q) => {
+    await q.query("UPDATE projects SET status = 'published', updated_at = $2 WHERE id = $1", [p.id, now])
+    await q.query('INSERT INTO publish_events (project_id, type, scene_version_id, at) VALUES ($1, $2, $3, $4)', [p.id, 'resume', p.published_scene_id, now])
   })
-  tx()
 }
 
-export function unpublishProject(db: Db, p: ProjectRow) {
+export async function unpublishProject(db: Db, p: ProjectRow) {
   const now = nowIso()
-  const tx = db.transaction(() => {
-    db.prepare("UPDATE projects SET status = 'unpublished', updated_at = ? WHERE id = ?").run(now, p.id)
-    db.prepare('INSERT INTO publish_events (project_id, type, scene_version_id, at) VALUES (?, ?, ?, ?)').run(p.id, 'unpublish', p.published_scene_id, now)
+  await db.tx(async (q) => {
+    await q.query("UPDATE projects SET status = 'unpublished', updated_at = $2 WHERE id = $1", [p.id, now])
+    await q.query('INSERT INTO publish_events (project_id, type, scene_version_id, at) VALUES ($1, $2, $3, $4)', [p.id, 'unpublish', p.published_scene_id, now])
   })
-  tx()
 }
 
 export type PublishEventType = 'publish' | 'republish' | 'unpublish' | 'resume' | 'delete'
@@ -222,24 +182,23 @@ export interface PublishEventRow {
   at: string
 }
 
-export function listPublishEvents(db: Db, projectId: string): PublishEventRow[] {
-  return db.prepare('SELECT type, scene_version_id, at FROM publish_events WHERE project_id = ? ORDER BY at').all(projectId) as PublishEventRow[]
-}
+export const listPublishEvents = (db: Queryable, projectId: string) =>
+  all<PublishEventRow>(db, 'SELECT type, scene_version_id, at FROM publish_events WHERE project_id = $1 ORDER BY at, id', [projectId])
 
 /** 公開版シーンが参照しているアセット ID */
-export function publishedAssetIds(db: Db, p: ProjectRow): Set<string> {
+export async function publishedAssetIds(db: Queryable, p: ProjectRow): Promise<Set<string>> {
   const ids = new Set<string>()
   if (!p.published_scene_id) return ids
-  const v = getSceneVersion(db, p.published_scene_id)
+  const v = await getSceneVersion(db, p.published_scene_id)
   if (!v) return ids
   const s = parseScene(v.scene)
   for (const id of [s.target.imageAssetId, s.target.mindAssetId, s.overlay?.assetId, s.overlay?.thumbnailAssetId]) if (id) ids.add(id)
   return ids
 }
 
-export function assetMap(db: Db, projectId: string) {
+export async function assetMap(db: Queryable, projectId: string) {
   const out: Record<string, ReturnType<typeof toAssetInfo>> = {}
-  for (const a of listAssets(db, projectId)) out[a.id] = toAssetInfo(a)
+  for (const a of await listAssets(db, projectId)) out[a.id] = toAssetInfo(a)
   return out
 }
 
@@ -252,14 +211,58 @@ export interface StatsRow {
   count: number
 }
 
-export function queryStats(db: Db, projectId: string, from: string, to: string): StatsRow[] {
-  return (
-    db
-      .prepare(
-        `SELECT day_jst AS day, type, button_id AS buttonId, os, COUNT(*) AS count
-         FROM analytics_events WHERE project_id = ? AND day_jst BETWEEN ? AND ?
-         GROUP BY day_jst, type, button_id, os ORDER BY day_jst`,
-      )
-      .all(projectId, from, to) as StatsRow[]
+export async function queryStats(db: Queryable, projectId: string, from: string, to: string): Promise<StatsRow[]> {
+  const rows = await all<{ day: string; type: string; buttonid: string | null; os: string; count: unknown }>(
+    db,
+    `SELECT day_jst AS day, type, button_id AS buttonid, os, COUNT(*) AS count
+     FROM analytics_events WHERE project_id = $1 AND day_jst BETWEEN $2 AND $3
+     GROUP BY day_jst, type, button_id, os ORDER BY day_jst`,
+    [projectId, from, to],
   )
+  return rows.map((r) => ({ day: r.day, type: r.type, buttonId: r.buttonid, os: r.os, count: num(r.count) }))
 }
+
+// ---------------------------------------------------------------- 掃除（Q4 → Vercel Cron）
+export const CLEANUP_GRACE_MS = 15 * 60_000
+
+export interface CleanupResult {
+  assetsDeleted: number
+  orphanBlobsDeleted: number
+  sessionsDeleted: number
+}
+
+/**
+ * - 下書きにも公開版にも参照されず、作成から 15 分以上経った素材を削除（Q4）
+ * - DB に無い迷子の Blob（登録前に離脱したアップロード）を削除
+ * - 期限切れセッション、古いレート制限 / ログインロック行を削除
+ */
+export async function runCleanup(db: Db, storage: Storage, now = Date.now()): Promise<CleanupResult> {
+  const cutoff = new Date(now - CLEANUP_GRACE_MS).toISOString()
+  const result: CleanupResult = { assetsDeleted: 0, orphanBlobsDeleted: 0, sessionsDeleted: 0 }
+  const projects = await all<ProjectRow>(db, "SELECT * FROM projects WHERE status <> 'deleted'")
+  for (const p of projects) {
+    const keep = await publishedAssetIds(db, p)
+    const d = parseScene(p.draft_scene)
+    for (const id of [d.target.imageAssetId, d.target.mindAssetId, d.overlay?.assetId, d.overlay?.thumbnailAssetId]) if (id) keep.add(id)
+    for (const a of await listAssets(db, p.id)) {
+      if (keep.has(a.id) || a.created_at > cutoff) continue
+      await deleteAsset(db, storage, a)
+      result.assetsDeleted++
+    }
+  }
+  if (storage.list) {
+    const known = new Set((await all<{ storage_key: string }>(db, 'SELECT storage_key FROM assets')).map((r) => r.storage_key))
+    for (const obj of await storage.list('projects/')) {
+      if (known.has(obj.key) || obj.uploadedAt.getTime() > now - CLEANUP_GRACE_MS) continue
+      await storage.delete(obj).catch(() => {})
+      result.orphanBlobsDeleted++
+    }
+  }
+  const s = await db.query('DELETE FROM sessions WHERE expires_at < $1 RETURNING id', [new Date(now).toISOString()])
+  result.sessionsDeleted = s.rows.length
+  await db.query('DELETE FROM rate_limits WHERE window_start < $1', [now - 3600_000])
+  await db.query('DELETE FROM login_locks WHERE locked_until < $1 AND last_attempt < $1', [now - 3600_000])
+  return result
+}
+
+export type { AssetRow }
