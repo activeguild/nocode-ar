@@ -1,13 +1,12 @@
-import compression from 'compression'
-import { timingSafeEqual } from 'node:crypto'
-import express, { type NextFunction, type Request, type Response } from 'express'
-import fs from 'node:fs'
-import path from 'node:path'
-import multer from 'multer'
+// Hono アプリ（Cloudflare Workers と Node の両方で動く）。API・素材配信・計測・掃除エンドポイントを提供する。
+import { Buffer } from 'node:buffer'
+import { Hono } from 'hono'
+import { compress } from 'hono/compress'
+import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import QRCode from 'qrcode'
 import { z } from 'zod'
-import { ASSET_KINDS, LIMITS, analyticsEventSchema, publishBlockers, sceneSchema, toDayJst, type AssetKind } from '../../shared/src/index.js'
-import { AssetError, KIND_LIMITS, deleteAsset, getAsset, registerUploadedAsset, saveAsset, toAssetInfo } from './assets.js'
+import { ASSET_KINDS, analyticsEventSchema, publishBlockers, sceneSchema, toDayJst, type AssetKind } from '../../shared/src/index.js'
+import { AssetError, KIND_MAX_BYTES, deleteAsset, getAsset, saveAsset, toAssetInfo } from './assets.js'
 import {
   attachUser,
   checkOrigin,
@@ -19,8 +18,11 @@ import {
   isLocked,
   recordFailure,
   requireAuth,
+  safeEqual,
   sessionCookie,
   verifyPassword,
+  type AppContext,
+  type AppVariables,
 } from './auth.js'
 import type { Config } from './config.js'
 import type { Db } from './db.js'
@@ -59,8 +61,9 @@ const emailSchema = z.string().trim().toLowerCase().email().max(254)
 const passwordSchema = z.string().min(8).max(200)
 const nameSchema = z.string().trim().min(1).max(60)
 const daySchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/)
+const JSON_BODY_LIMIT = 1024 * 1024
 
-class HttpError extends Error {
+export class HttpError extends Error {
   constructor(
     public status: number,
     message: string,
@@ -69,11 +72,15 @@ class HttpError extends Error {
   }
 }
 
-function publicOrigin(req: Request, config: Config): string {
+function publicOrigin(c: AppContext, config: Config): string {
   if (config.publicOrigin) return config.publicOrigin
-  const proto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0] || req.protocol
-  const host = (req.headers['x-forwarded-host'] as string | undefined)?.split(',')[0] || req.headers.host
-  return `${proto}://${host}`
+  const url = new URL(c.req.url)
+  if (config.trustProxy) {
+    const proto = c.req.header('x-forwarded-proto')?.split(',')[0]
+    const host = c.req.header('x-forwarded-host')?.split(',')[0]
+    if (host) return `${proto || url.protocol.replace(':', '')}://${host}`
+  }
+  return url.origin
 }
 
 /** FR-7-6 / NFR-9: 計測イベントのレート制限（slug ごと 60 req/分。DB に保持） */
@@ -90,113 +97,111 @@ async function rateLimitAllowed(db: Db, key: string, limit: number, windowMs: nu
   return num(r.rows[0]?.count) <= limit
 }
 
+/** Range ヘッダ（bytes=start-end / bytes=start- / bytes=-suffix）を解釈する */
+export function parseRange(header: string | undefined, size: number): { start: number; end: number } | null | 'invalid' {
+  if (!header) return null
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim())
+  if (!m || (m[1] === '' && m[2] === '')) return 'invalid'
+  let start: number
+  let end: number
+  if (m[1] === '') {
+    const suffix = Number(m[2])
+    if (suffix === 0) return 'invalid'
+    start = Math.max(0, size - suffix)
+    end = size - 1
+  } else {
+    start = Number(m[1])
+    end = m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1)
+  }
+  if (start > end || start >= size) return 'invalid'
+  return { start, end }
+}
+
 export function createApp({ db, storage, config }: AppDeps) {
-  const app = express()
-  app.disable('x-powered-by')
-  app.set('trust proxy', config.trustProxy)
-  // D-05: ローカル / Docker では Express で gzip / brotli。Vercel ではエッジが圧縮するため不要
-  if (!config.isVercel) {
-    app.use(
-      compression({
-        threshold: 1024,
-        filter: (req, res) => req.path.endsWith('.mind') || compression.filter(req, res),
-      }),
-    )
+  const app = new Hono<{ Variables: AppVariables }>()
+
+  if (config.compressResponses) app.use('*', compress())
+  app.use('*', attachUser(db))
+  app.use('/api/*', checkOrigin(config.trustProxy))
+  // JSON API の本文上限（素材アップロードを除く）D-08
+  app.use('/api/*', async (c, next) => {
+    if (c.req.path.endsWith('/assets') && c.req.method === 'POST') return next()
+    const len = Number(c.req.header('content-length') ?? 0)
+    if (len > JSON_BODY_LIMIT) return c.json({ error: '送信データが大きすぎます（1 MB まで）' }, 413)
+    await next()
+  })
+
+  const json = async <T>(c: AppContext): Promise<T> => {
+    try {
+      return (await c.req.json()) as T
+    } catch {
+      throw new HttpError(400, 'JSON の形式が不正です')
+    }
   }
-  app.use(express.json({ limit: '1mb' }))
-  app.use(attachUser(db))
-  app.use('/api', checkOrigin)
-
-  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: LIMITS.videoBytes + 1024 } })
-  const uploadMode: 'blob' | 'direct' = storage.kind === 'blob' ? 'blob' : 'direct'
-
-  const wrap = (fn: (req: Request, res: Response) => Promise<void> | void) => (req: Request, res: Response, next: NextFunction) => {
-    Promise.resolve(fn(req, res)).catch(next)
-  }
-
-  const ownProject = async (req: Request): Promise<ProjectRow> => {
-    const p = await getProject(db, req.user!.id, String(req.params.id))
+  const user = (c: AppContext) => c.get('user')!
+  const ownProject = async (c: AppContext): Promise<ProjectRow> => {
+    const p = await getProject(db, user(c).id, c.req.param('id') ?? '')
     if (!p) throw new HttpError(404, 'プロジェクトが見つかりません')
     return p
   }
 
-  // ---- 設定（R9 のサポート連絡先、アップロード方式）
-  app.get('/api/config', (_req, res) => {
-    res.json({ serviceName: config.serviceName, supportEmail: config.supportEmail, uploadMode })
-  })
+  // ---- 設定（R9 のサポート連絡先など）
+  app.get('/api/config', (c) => c.json({ serviceName: config.serviceName, supportEmail: config.supportEmail, uploadMode: 'direct' }))
 
   // ---- 認証（FR-1）
-  app.post(
-    '/api/auth/signup',
-    wrap(async (req, res) => {
-      const body = z.object({ email: emailSchema, password: passwordSchema }).safeParse(req.body)
-      if (!body.success) throw new HttpError(400, 'メールアドレスの形式、または 8 文字以上のパスワードを確認してください')
-      if (await findUserByEmail(db, body.data.email)) throw new HttpError(409, 'このメールアドレスは登録済みです')
-      const user = await createUser(db, body.data.email, body.data.password)
-      const sid = await createSession(db, user.id)
-      res.setHeader('Set-Cookie', sessionCookie(sid, config.cookieSecure))
-      res.status(201).json({ user })
-    }),
-  )
+  app.post('/api/auth/signup', async (c) => {
+    const body = z.object({ email: emailSchema, password: passwordSchema }).safeParse(await json(c))
+    if (!body.success) throw new HttpError(400, 'メールアドレスの形式、または 8 文字以上のパスワードを確認してください')
+    if (await findUserByEmail(db, body.data.email)) throw new HttpError(409, 'このメールアドレスは登録済みです')
+    const u = await createUser(db, body.data.email, body.data.password)
+    const sid = await createSession(db, u.id)
+    c.header('Set-Cookie', sessionCookie(sid, config.cookieSecure))
+    return c.json({ user: u }, 201)
+  })
 
-  app.post(
-    '/api/auth/login',
-    wrap(async (req, res) => {
-      const body = z.object({ email: emailSchema, password: z.string().max(200) }).safeParse(req.body)
-      if (!body.success) throw new HttpError(400, 'メールアドレスまたはパスワードが違います')
-      const { email, password } = body.data
-      if (await isLocked(db, email)) throw new HttpError(429, 'ログインに連続して失敗したため、15 分間ロックされています')
-      const user = await findUserByEmail(db, email)
-      if (!user || !verifyPassword(password, user.passwordHash)) {
-        await recordFailure(db, email)
-        throw new HttpError(401, 'メールアドレスまたはパスワードが違います')
-      }
-      await clearFailures(db, email)
-      const sid = await createSession(db, user.id)
-      res.setHeader('Set-Cookie', sessionCookie(sid, config.cookieSecure))
-      res.json({ user: { id: user.id, email: user.email } })
-    }),
-  )
-
-  app.post(
-    '/api/auth/logout',
-    wrap(async (req, res) => {
-      if (req.sessionId) await deleteSession(db, req.sessionId)
-      res.setHeader('Set-Cookie', sessionCookie('', config.cookieSecure, true))
-      res.status(204).end()
-    }),
-  )
-
-  app.get('/api/auth/me', (req, res) => {
-    if (!req.user) {
-      res.status(401).json({ error: 'ログインが必要です' })
-      return
+  app.post('/api/auth/login', async (c) => {
+    const body = z.object({ email: emailSchema, password: z.string().max(200) }).safeParse(await json(c))
+    if (!body.success) throw new HttpError(400, 'メールアドレスまたはパスワードが違います')
+    const { email, password } = body.data
+    if (await isLocked(db, email)) throw new HttpError(429, 'ログインに連続して失敗したため、15 分間ロックされています')
+    const u = await findUserByEmail(db, email)
+    if (!u || !verifyPassword(password, u.passwordHash)) {
+      await recordFailure(db, email)
+      throw new HttpError(401, 'メールアドレスまたはパスワードが違います')
     }
-    res.json({ user: req.user })
+    await clearFailures(db, email)
+    const sid = await createSession(db, u.id)
+    c.header('Set-Cookie', sessionCookie(sid, config.cookieSecure))
+    return c.json({ user: { id: u.id, email: u.email } })
+  })
+
+  app.post('/api/auth/logout', async (c) => {
+    const sid = c.get('sessionId')
+    if (sid) await deleteSession(db, sid)
+    c.header('Set-Cookie', sessionCookie('', config.cookieSecure, true))
+    return c.body(null, 204)
+  })
+
+  app.get('/api/auth/me', (c) => {
+    const u = c.get('user')
+    if (!u) return c.json({ error: 'ログインが必要です' }, 401)
+    return c.json({ user: u })
   })
 
   // ---- プロジェクト（FR-2）
-  app.get(
-    '/api/projects',
-    requireAuth,
-    wrap(async (req, res) => {
-      const rows = await listProjects(db, req.user!.id)
-      res.json({ projects: await Promise.all(rows.map((p) => toSummary(db, p))) })
-    }),
-  )
+  app.get('/api/projects', requireAuth, async (c) => {
+    const rows = await listProjects(db, user(c).id)
+    return c.json({ projects: await Promise.all(rows.map((p) => toSummary(db, p))) })
+  })
 
-  app.post(
-    '/api/projects',
-    requireAuth,
-    wrap(async (req, res) => {
-      const body = z.object({ name: nameSchema }).safeParse(req.body)
-      if (!body.success) throw new HttpError(400, 'プロジェクト名を 1〜60 文字で入力してください')
-      const p = await createProject(db, req.user!.id, body.data.name)
-      res.status(201).json({ project: await toSummary(db, p) })
-    }),
-  )
+  app.post('/api/projects', requireAuth, async (c) => {
+    const body = z.object({ name: nameSchema }).safeParse(await json(c))
+    if (!body.success) throw new HttpError(400, 'プロジェクト名を 1〜60 文字で入力してください')
+    const p = await createProject(db, user(c).id, body.data.name)
+    return c.json({ project: await toSummary(db, p) }, 201)
+  })
 
-  const projectDetail = async (req: Request, p: ProjectRow) => {
+  const projectDetail = async (c: AppContext, p: ProjectRow) => {
     const published = p.published_scene_id ? await getSceneVersion(db, p.published_scene_id) : null
     return {
       project: await toSummary(db, p),
@@ -204,47 +209,33 @@ export function createApp({ db, storage, config }: AppDeps) {
       publishedScene: published ? parseScene(published.scene) : null,
       publishedAt: published?.published_at ?? null,
       assets: await assetMap(db, p.id),
-      publicUrl: `${publicOrigin(req, config)}/v/${p.slug}`,
-      previewUrl: `${publicOrigin(req, config)}/p/${p.preview_token}`,
+      publicUrl: `${publicOrigin(c, config)}/v/${p.slug}`,
+      previewUrl: `${publicOrigin(c, config)}/p/${p.preview_token}`,
       publishEvents: (await listPublishEvents(db, p.id)).map((e) => ({ type: e.type, at: e.at, sceneVersionId: e.scene_version_id })),
     }
   }
 
-  app.get(
-    '/api/projects/:id',
-    requireAuth,
-    wrap(async (req, res) => {
-      res.json(await projectDetail(req, await ownProject(req)))
-    }),
-  )
+  app.get('/api/projects/:id', requireAuth, async (c) => c.json(await projectDetail(c, await ownProject(c))))
 
-  app.patch(
-    '/api/projects/:id',
-    requireAuth,
-    wrap(async (req, res) => {
-      const p = await ownProject(req)
-      const body = z.object({ name: nameSchema.optional(), draftScene: sceneSchema.optional() }).safeParse(req.body)
-      // D-07: zod の英語メッセージは出さず、項目名のみ日本語で示す
-      if (!body.success) throw new HttpError(400, '入力内容に誤りがあります（' + [...new Set(body.error.issues.map((i) => i.path.join('.') || 'body'))].join(', ') + '）')
-      if (body.data.draftScene) {
-        const s = body.data.draftScene
-        for (const id of [s.target.imageAssetId, s.target.mindAssetId, s.overlay?.assetId, s.overlay?.thumbnailAssetId]) {
-          if (id && (await getAsset(db, id))?.project_id !== p.id) throw new HttpError(400, '不正な素材が指定されています')
-        }
+  app.patch('/api/projects/:id', requireAuth, async (c) => {
+    const p = await ownProject(c)
+    const body = z.object({ name: nameSchema.optional(), draftScene: sceneSchema.optional() }).safeParse(await json(c))
+    // D-07: zod の英語メッセージは出さず、項目名のみ日本語で示す
+    if (!body.success) throw new HttpError(400, '入力内容に誤りがあります（' + [...new Set(body.error.issues.map((i) => i.path.join('.') || 'body'))].join(', ') + '）')
+    if (body.data.draftScene) {
+      const s = body.data.draftScene
+      for (const id of [s.target.imageAssetId, s.target.mindAssetId, s.overlay?.assetId, s.overlay?.thumbnailAssetId]) {
+        if (id && (await getAsset(db, id))?.project_id !== p.id) throw new HttpError(400, '不正な素材が指定されています')
       }
-      await updateProject(db, p.id, body.data)
-      res.json(await projectDetail(req, await ownProject(req)))
-    }),
-  )
+    }
+    await updateProject(db, p.id, body.data)
+    return c.json(await projectDetail(c, await ownProject(c)))
+  })
 
-  app.delete(
-    '/api/projects/:id',
-    requireAuth,
-    wrap(async (req, res) => {
-      await deleteProject(db, storage, await ownProject(req))
-      res.status(204).end()
-    }),
-  )
+  app.delete('/api/projects/:id', requireAuth, async (c) => {
+    await deleteProject(db, storage, await ownProject(c))
+    return c.body(null, 204)
+  })
 
   // ---- 素材（FR-3, FR-4）
   const numField = (v: unknown) => {
@@ -252,411 +243,250 @@ export function createApp({ db, storage, config }: AppDeps) {
     return Number.isFinite(n) && n > 0 ? n : null
   }
 
-  // 直接アップロード（ローカル / Docker。Vercel では本文上限 4.5 MB のため Blob 直接アップロードを使う）
-  app.post(
-    '/api/projects/:id/assets',
-    requireAuth,
-    upload.single('file'),
-    wrap(async (req, res) => {
-      const p = await ownProject(req)
-      const kind = String(req.body?.kind ?? '') as AssetKind
-      if (!ASSET_KINDS.includes(kind)) throw new HttpError(400, 'kind が不正です')
-      if (!req.file) throw new HttpError(400, 'ファイルがありません')
-      const a = await saveAsset(db, storage, {
-        projectId: p.id,
-        userId: req.user!.id,
-        accountQuotaBytes: config.accountQuotaBytes,
-        kind,
-        buffer: req.file.buffer,
-        width: numField(req.body.width),
-        height: numField(req.body.height),
-        durationSec: numField(req.body.durationSec),
-      })
-      res.status(201).json({ asset: toAssetInfo(a) })
-    }),
-  )
+  /**
+   * アップロード。2 形式を受ける:
+   * - multipart/form-data（kind, file, width, height, durationSec）
+   * - 生ボディ（body = ファイル。kind 等はクエリ。Content-Length 必須）: 大きな動画をメモリに載せずストレージへ流す
+   * 鍵と URL はサーバが生成する（クライアントの鍵 / URL は受け取らない）
+   */
+  app.post('/api/projects/:id/assets', requireAuth, async (c) => {
+    const p = await ownProject(c)
+    const ct = c.req.header('content-type') ?? ''
+    let kind: string
+    let body: Buffer | ReadableStream<Uint8Array>
+    let size: number
+    let meta: Record<string, unknown>
+    let contentTypeHint: string | null = null
+    if (ct.startsWith('multipart/form-data')) {
+      const fd = await c.req.formData()
+      kind = String(fd.get('kind') ?? '')
+      const file = fd.get('file')
+      if (!(file instanceof Blob)) throw new HttpError(400, 'ファイルがありません')
+      body = Buffer.from(await file.arrayBuffer())
+      size = body.length
+      meta = { width: fd.get('width'), height: fd.get('height'), durationSec: fd.get('durationSec') }
+    } else {
+      kind = c.req.query('kind') ?? ''
+      size = Number(c.req.header('content-length') ?? NaN)
+      if (!Number.isFinite(size) || size <= 0) throw new HttpError(400, 'Content-Length が必要です')
+      if (!c.req.raw.body) throw new HttpError(400, 'ファイルがありません')
+      if (!ASSET_KINDS.includes(kind as AssetKind)) throw new HttpError(400, 'kind が不正です')
+      if (size > KIND_MAX_BYTES[kind as AssetKind]) throw new AssetError(413, 'ファイルが大きすぎます（動画 50 MB / 3D 20 MB / 画像 10 MB）', 'too_large')
+      // ターゲットデータは gzip して保存するため本体をメモリに載せる（上限 20 MB）。それ以外はストレージへ流す
+      body = kind === 'target_mind' ? Buffer.from(await c.req.arrayBuffer()) : (c.req.raw.body as ReadableStream<Uint8Array>)
+      if (Buffer.isBuffer(body)) size = body.length
+      contentTypeHint = ct || null
+      meta = { width: c.req.query('width'), height: c.req.query('height'), durationSec: c.req.query('durationSec') }
+    }
+    if (!ASSET_KINDS.includes(kind as AssetKind)) throw new HttpError(400, 'kind が不正です')
+    if (size > KIND_MAX_BYTES[kind as AssetKind]) throw new AssetError(413, 'ファイルが大きすぎます（動画 50 MB / 3D 20 MB / 画像 10 MB）', 'too_large')
+    const a = await saveAsset(db, storage, {
+      projectId: p.id,
+      userId: user(c).id,
+      accountQuotaBytes: config.accountQuotaBytes,
+      kind: kind as AssetKind,
+      body,
+      size,
+      contentTypeHint,
+      width: numField(meta.width),
+      height: numField(meta.height),
+      durationSec: numField(meta.durationSec),
+    })
+    return c.json({ asset: toAssetInfo(a) }, 201)
+  })
 
-  // Blob 直接アップロード: トークン発行（@vercel/blob/client の upload() から呼ばれる）
-  app.post(
-    '/api/projects/:id/blob-upload',
-    requireAuth,
-    wrap(async (req, res) => {
-      if (storage.kind !== 'blob' || !config.blobToken) throw new HttpError(404, 'Blob アップロードは無効です')
-      const p = await ownProject(req)
-      const { handleUpload } = await import('@vercel/blob/client')
-      const result = await handleUpload({
-        token: config.blobToken,
-        body: req.body,
-        request: req,
-        onBeforeGenerateToken: async (pathname, clientPayload) => {
-          let kind: AssetKind | null = null
-          let type: string | null = null
-          try {
-            const payload = JSON.parse(clientPayload ?? '{}')
-            kind = payload.kind ?? null
-            type = payload.type ?? null
-          } catch {
-            kind = null
-          }
-          if (!kind || !ASSET_KINDS.includes(kind)) throw new Error('kind が不正です')
-          const re = new RegExp(`^projects/${p.id}/${kind}/[A-Za-z0-9_.-]{1,80}$`)
-          if (!re.test(pathname)) throw new Error('アップロード先のパスが不正です')
-          // M-R3-01: オーバーレイは種別（video / image / model）ごとの上限と Content-Type にする
-          let lim = KIND_LIMITS[kind]
-          if (kind === 'overlay') {
-            if (type === 'video') lim = { maxBytes: LIMITS.videoBytes, contentTypes: ['video/mp4'] }
-            else if (type === 'image') lim = { maxBytes: LIMITS.imageBytes, contentTypes: ['image/png', 'image/jpeg', 'image/webp'] }
-            else if (type === 'model') lim = { maxBytes: LIMITS.modelBytes, contentTypes: ['model/gltf-binary', 'application/octet-stream'] }
-            else throw new Error('コンテンツの種別（video / image / model）を指定してください')
-          }
-          return {
-            allowedContentTypes: lim.contentTypes,
-            maximumSizeInBytes: lim.maxBytes,
-            addRandomSuffix: true,
-            tokenPayload: JSON.stringify({ projectId: p.id, userId: req.user!.id, kind }),
-          }
-        },
-        // 完了通知（Webhook）はローカルでは届かないため使わず、クライアントが /assets/register を呼ぶ
-        onUploadCompleted: async () => {},
-      })
-      res.json(result)
-    }),
-  )
-
-  // Blob 直接アップロードの登録（所有権・形式・寸法・上限をサーバで検証）
-  app.post(
-    '/api/projects/:id/assets/register',
-    requireAuth,
-    wrap(async (req, res) => {
-      if (storage.kind === 'local') throw new HttpError(404, 'この環境では直接アップロードを使用してください')
-      const p = await ownProject(req)
-      const body = z
-        .object({
-          kind: z.enum(ASSET_KINDS),
-          // url は照合用（任意）。取得・削除には使わない（B-R3-01）
-          url: z.string().url().max(2048).optional(),
-          pathname: z.string().min(1).max(200),
-          width: z.coerce.number().positive().optional(),
-          height: z.coerce.number().positive().optional(),
-          durationSec: z.coerce.number().positive().optional(),
-        })
-        .safeParse(req.body)
-      if (!body.success) throw new HttpError(400, '登録内容が不正です')
-      const a = await registerUploadedAsset(db, storage, {
-        projectId: p.id,
-        userId: req.user!.id,
-        accountQuotaBytes: config.accountQuotaBytes,
-        kind: body.data.kind,
-        key: body.data.pathname,
-        url: body.data.url ?? null,
-        width: body.data.width ?? null,
-        height: body.data.height ?? null,
-        durationSec: body.data.durationSec ?? null,
-      })
-      res.status(201).json({ asset: toAssetInfo(a) })
-    }),
-  )
-
-  app.delete(
-    '/api/projects/:id/assets/:assetId',
-    requireAuth,
-    wrap(async (req, res) => {
-      const p = await ownProject(req)
-      const a = await getAsset(db, String(req.params.assetId))
-      if (!a || a.project_id !== p.id) throw new HttpError(404, '素材が見つかりません')
-      if ((await publishedAssetIds(db, p)).has(a.id)) throw new HttpError(409, '公開中の AR が使用している素材は削除できません')
-      await deleteAsset(db, storage, a)
-      res.status(204).end()
-    }),
-  )
+  app.delete('/api/projects/:id/assets/:assetId', requireAuth, async (c) => {
+    const p = await ownProject(c)
+    const a = await getAsset(db, c.req.param('assetId'))
+    if (!a || a.project_id !== p.id) throw new HttpError(404, '素材が見つかりません')
+    if ((await publishedAssetIds(db, p)).has(a.id)) throw new HttpError(409, '公開中の AR が使用している素材は削除できません')
+    await deleteAsset(db, storage, a)
+    return c.body(null, 204)
+  })
 
   // ---- 公開・停止・プレビュー・QR（FR-6）
-  app.post(
-    '/api/projects/:id/publish',
-    requireAuth,
-    wrap(async (req, res) => {
-      const p = await ownProject(req)
-      const blockers = publishBlockers(parseScene(p.draft_scene))
-      if (blockers.length) throw new HttpError(400, blockers.join('。'))
-      await publishProject(db, p, req.user!.id)
-      res.json(await projectDetail(req, await ownProject(req)))
-    }),
-  )
+  app.post('/api/projects/:id/publish', requireAuth, async (c) => {
+    const p = await ownProject(c)
+    const blockers = publishBlockers(parseScene(p.draft_scene))
+    if (blockers.length) throw new HttpError(400, blockers.join('。'))
+    await publishProject(db, p, user(c).id)
+    return c.json(await projectDetail(c, await ownProject(c)))
+  })
 
-  app.post(
-    '/api/projects/:id/unpublish',
-    requireAuth,
-    wrap(async (req, res) => {
-      const p = await ownProject(req)
-      if (p.status !== 'published') throw new HttpError(400, '公開中ではありません')
-      await unpublishProject(db, p)
-      res.json(await projectDetail(req, await ownProject(req)))
-    }),
-  )
+  app.post('/api/projects/:id/unpublish', requireAuth, async (c) => {
+    const p = await ownProject(c)
+    if (p.status !== 'published') throw new HttpError(400, '公開中ではありません')
+    await unpublishProject(db, p)
+    return c.json(await projectDetail(c, await ownProject(c)))
+  })
 
-  app.post(
-    '/api/projects/:id/resume',
-    requireAuth,
-    wrap(async (req, res) => {
-      const p = await ownProject(req)
-      if (p.status !== 'unpublished' || !p.published_scene_id) throw new HttpError(400, '停止中の AR のみ再開できます')
-      await resumeProject(db, p)
-      res.json(await projectDetail(req, await ownProject(req)))
-    }),
-  )
+  app.post('/api/projects/:id/resume', requireAuth, async (c) => {
+    const p = await ownProject(c)
+    if (p.status !== 'unpublished' || !p.published_scene_id) throw new HttpError(400, '停止中の AR のみ再開できます')
+    await resumeProject(db, p)
+    return c.json(await projectDetail(c, await ownProject(c)))
+  })
 
-  app.post(
-    '/api/projects/:id/preview-token',
-    requireAuth,
-    wrap(async (req, res) => {
-      const p = await ownProject(req)
-      await rotatePreviewToken(db, p.id)
-      res.json(await projectDetail(req, await ownProject(req)))
-    }),
-  )
+  app.post('/api/projects/:id/preview-token', requireAuth, async (c) => {
+    const p = await ownProject(c)
+    await rotatePreviewToken(db, p.id)
+    return c.json(await projectDetail(c, await ownProject(c)))
+  })
 
   const qrOptions = { errorCorrectionLevel: 'M' as const, margin: 4 }
-  app.get(
-    '/api/projects/:id/qr.png',
-    requireAuth,
-    wrap(async (req, res) => {
-      const p = await ownProject(req)
-      const buf = await QRCode.toBuffer(`${publicOrigin(req, config)}/v/${p.slug}`, { ...qrOptions, type: 'png', width: 1024 })
-      res.setHeader('Content-Type', 'image/png')
-      res.setHeader('Content-Disposition', `attachment; filename="qr-${p.slug}.png"`)
-      res.send(buf)
-    }),
-  )
-  app.get(
-    '/api/projects/:id/qr.svg',
-    requireAuth,
-    wrap(async (req, res) => {
-      const p = await ownProject(req)
-      const svg = await QRCode.toString(`${publicOrigin(req, config)}/v/${p.slug}`, { ...qrOptions, type: 'svg' })
-      res.setHeader('Content-Type', 'image/svg+xml')
-      res.setHeader('Content-Disposition', `attachment; filename="qr-${p.slug}.svg"`)
-      res.send(svg)
-    }),
-  )
-  app.get(
-    '/api/projects/:id/preview-qr.png',
-    requireAuth,
-    wrap(async (req, res) => {
-      const p = await ownProject(req)
-      const buf = await QRCode.toBuffer(`${publicOrigin(req, config)}/p/${p.preview_token}`, { ...qrOptions, type: 'png', width: 512 })
-      res.setHeader('Content-Type', 'image/png')
-      res.setHeader('Cache-Control', 'no-store')
-      res.send(buf)
-    }),
-  )
+  app.get('/api/projects/:id/qr.png', requireAuth, async (c) => {
+    const p = await ownProject(c)
+    const buf = await QRCode.toBuffer(`${publicOrigin(c, config)}/v/${p.slug}`, { ...qrOptions, type: 'png', width: 1024 })
+    return c.body(new Uint8Array(buf), 200, { 'Content-Type': 'image/png', 'Content-Disposition': `attachment; filename="qr-${p.slug}.png"` })
+  })
+  app.get('/api/projects/:id/qr.svg', requireAuth, async (c) => {
+    const p = await ownProject(c)
+    const svg = await QRCode.toString(`${publicOrigin(c, config)}/v/${p.slug}`, { ...qrOptions, type: 'svg' })
+    return c.body(svg, 200, { 'Content-Type': 'image/svg+xml', 'Content-Disposition': `attachment; filename="qr-${p.slug}.svg"` })
+  })
+  app.get('/api/projects/:id/preview-qr.png', requireAuth, async (c) => {
+    const p = await ownProject(c)
+    const buf = await QRCode.toBuffer(`${publicOrigin(c, config)}/p/${p.preview_token}`, { ...qrOptions, type: 'png', width: 512 })
+    return c.body(new Uint8Array(buf), 200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' })
+  })
 
   // ---- 計測（FR-9）
-  const statsRange = (req: Request) => {
-    const q = z.object({ from: daySchema, to: daySchema }).safeParse(req.query)
+  const statsRange = (c: AppContext) => {
+    const q = z.object({ from: daySchema, to: daySchema }).safeParse({ from: c.req.query('from'), to: c.req.query('to') })
     if (!q.success) throw new HttpError(400, 'from / to は YYYY-MM-DD で指定してください')
     if (q.data.from > q.data.to) throw new HttpError(400, '開始日は終了日以前にしてください') // D-15
     return q.data
   }
-  app.get(
-    '/api/projects/:id/stats',
-    requireAuth,
-    wrap(async (req, res) => {
-      const p = await ownProject(req)
-      const { from, to } = statsRange(req)
-      res.json({ from, to, rows: await queryStats(db, p.id, from, to), publishEvents: (await listPublishEvents(db, p.id)).map((e) => ({ type: e.type, at: e.at })) })
-    }),
-  )
-  app.get(
-    '/api/projects/:id/stats.csv',
-    requireAuth,
-    wrap(async (req, res) => {
-      const p = await ownProject(req)
-      const { from, to } = statsRange(req)
-      const rows = await queryStats(db, p.id, from, to)
-      // D-02: 数式インジェクション対策。= + - @ タブ CR で始まるセルは ' を前置する
-      const esc = (v: unknown) => {
-        let t = String(v ?? '')
-        if (/^[=+\-@\t\r]/.test(t)) t = "'" + t
-        return `"${t.replace(/"/g, '""')}"`
-      }
-      const csv = ['﻿日付,種別,ボタンID,OS,回数', ...rows.map((r) => [r.day, r.type, r.buttonId, r.os, r.count].map(esc).join(','))].join('\r\n')
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8')
-      res.setHeader('Content-Disposition', `attachment; filename="stats-${p.slug}-${from}-${to}.csv"`)
-      res.send(csv)
-    }),
-  )
+  app.get('/api/projects/:id/stats', requireAuth, async (c) => {
+    const p = await ownProject(c)
+    const { from, to } = statsRange(c)
+    return c.json({ from, to, rows: await queryStats(db, p.id, from, to), publishEvents: (await listPublishEvents(db, p.id)).map((e) => ({ type: e.type, at: e.at })) })
+  })
+  app.get('/api/projects/:id/stats.csv', requireAuth, async (c) => {
+    const p = await ownProject(c)
+    const { from, to } = statsRange(c)
+    const rows = await queryStats(db, p.id, from, to)
+    // D-02: 数式インジェクション対策。= + - @ タブ CR で始まるセルは ' を前置する
+    const esc = (v: unknown) => {
+      let t = String(v ?? '')
+      if (/^[=+\-@\t\r]/.test(t)) t = "'" + t
+      return `"${t.replace(/"/g, '""')}"`
+    }
+    const csv = ['﻿日付,種別,ボタンID,OS,回数', ...rows.map((r) => [r.day, r.type, r.buttonId, r.os, r.count].map(esc).join(','))].join('\r\n')
+    return c.body(csv, 200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="stats-${p.slug}-${from}-${to}.csv"` })
+  })
 
   // ---- エクスポート（NFR-8: 構造のみ）
-  app.get(
-    '/api/projects/:id/export',
-    requireAuth,
-    wrap(async (req, res) => {
-      const p = await ownProject(req)
-      res.json({ project: await toSummary(db, p), draftScene: parseScene(p.draft_scene), assets: Object.values(await assetMap(db, p.id)) })
-    }),
-  )
+  app.get('/api/projects/:id/export', requireAuth, async (c) => {
+    const p = await ownProject(c)
+    return c.json({ project: await toSummary(db, p), draftScene: parseScene(p.draft_scene), assets: Object.values(await assetMap(db, p.id)) })
+  })
 
   // ---- 公開 API（FR-7）
-  app.get(
-    '/api/public/:slug',
-    wrap(async (req, res) => {
-      res.setHeader('Cache-Control', 'no-cache')
-      const p = await getProjectBySlug(db, String(req.params.slug))
-      if (!p) {
-        res.status(404).json({ reason: 'not_found' })
-        return
-      }
-      if (p.status === 'deleted' || p.status === 'unpublished') {
-        // R1 / Q1: 停止・削除後の「終了しました」画面にも、最後の公開版の行動ボタンと案内 URL を残す
-        const v = p.published_scene_id ? await getSceneVersion(db, p.published_scene_id) : null
-        const scene = v ? parseScene(v.scene) : null
-        res.status(410).json({ reason: 'unpublished', name: p.name, buttons: scene?.buttons ?? [], endedUrl: scene?.endedUrl ?? '' })
-        return
-      }
+  app.get('/api/public/:slug', async (c) => {
+    c.header('Cache-Control', 'no-cache')
+    const p = await getProjectBySlug(db, c.req.param('slug'))
+    if (!p) return c.json({ reason: 'not_found' }, 404)
+    if (p.status === 'deleted' || p.status === 'unpublished') {
+      // R1 / Q1: 停止・削除後の「終了しました」画面にも、最後の公開版の行動ボタンと案内 URL を残す
       const v = p.published_scene_id ? await getSceneVersion(db, p.published_scene_id) : null
-      if (p.status === 'draft' || !v) {
-        res.status(404).json({ reason: 'draft', name: p.name })
-        return
-      }
-      const scene = parseScene(v.scene)
-      // D-01: 公開版が参照する素材のみ返す
-      const refs = await publishedAssetIds(db, p)
-      const assets = Object.fromEntries(Object.entries(await assetMap(db, p.id)).filter(([id]) => refs.has(id)))
-      res.json({ name: p.name, slug: p.slug, scene, sceneVersionId: v.id, assets, preview: false })
-    }),
-  )
+      const scene = v ? parseScene(v.scene) : null
+      return c.json({ reason: 'unpublished', name: p.name, buttons: scene?.buttons ?? [], endedUrl: scene?.endedUrl ?? '' }, 410)
+    }
+    const v = p.published_scene_id ? await getSceneVersion(db, p.published_scene_id) : null
+    if (p.status === 'draft' || !v) return c.json({ reason: 'draft', name: p.name }, 404)
+    const scene = parseScene(v.scene)
+    // D-01: 公開版が参照する素材のみ返す
+    const refs = await publishedAssetIds(db, p)
+    const assets = Object.fromEntries(Object.entries(await assetMap(db, p.id)).filter(([id]) => refs.has(id)))
+    return c.json({ name: p.name, slug: p.slug, scene, sceneVersionId: v.id, assets, preview: false })
+  })
 
-  app.get(
-    '/api/preview/:token',
-    wrap(async (req, res) => {
-      res.setHeader('Cache-Control', 'no-store')
-      const p = await getProjectByPreviewToken(db, String(req.params.token))
-      if (!p || p.status === 'deleted') {
-        res.status(404).json({ reason: 'not_found' })
-        return
-      }
-      res.json({ name: p.name, slug: p.slug, scene: parseScene(p.draft_scene), sceneVersionId: null, assets: await assetMap(db, p.id), preview: true })
-    }),
-  )
+  app.get('/api/preview/:token', async (c) => {
+    c.header('Cache-Control', 'no-store')
+    const p = await getProjectByPreviewToken(db, c.req.param('token'))
+    if (!p || p.status === 'deleted') return c.json({ reason: 'not_found' }, 404)
+    return c.json({ name: p.name, slug: p.slug, scene: parseScene(p.draft_scene), sceneVersionId: null, assets: await assetMap(db, p.id), preview: true })
+  })
 
-  app.post(
-    '/api/public/:slug/events',
-    wrap(async (req, res) => {
-      const slug = String(req.params.slug)
-      const p = await getProjectBySlug(db, slug)
-      if (!p) throw new HttpError(404, 'not found') // D-16: 存在しない slug ではバケットを作らない
-      if (!(await rateLimitAllowed(db, `events:${slug}`, 60, 60_000))) throw new HttpError(429, 'too many requests')
-      const body = analyticsEventSchema.safeParse(req.body)
-      if (!body.success) throw new HttpError(400, 'invalid event')
-      // D-02: buttonId は公開版のボタン ID と照合する
-      let buttonId: string | null = null
-      if (body.data.type === 'cta_tap') {
-        const v = p.status === 'published' && p.published_scene_id ? await getSceneVersion(db, p.published_scene_id) : null
-        const ids = v ? parseScene(v.scene).buttons.map((b) => b.id) : []
-        if (!body.data.buttonId || !ids.includes(body.data.buttonId)) throw new HttpError(400, 'invalid buttonId')
-        buttonId = body.data.buttonId
-      }
-      const now = new Date()
-      await db.query('INSERT INTO analytics_events (project_id, scene_version_id, type, button_id, os, occurred_at, day_jst) VALUES ($1, $2, $3, $4, $5, $6, $7)', [
-        p.id,
-        p.status === 'published' ? p.published_scene_id : null,
-        body.data.type,
-        buttonId,
-        body.data.os,
-        now.toISOString(),
-        toDayJst(now),
-      ])
-      res.status(204).end()
-    }),
-  )
+  app.post('/api/public/:slug/events', async (c) => {
+    const slug = c.req.param('slug')
+    const p = await getProjectBySlug(db, slug)
+    if (!p) throw new HttpError(404, 'ページが見つかりません') // D-16: 存在しない slug ではバケットを作らない
+    if (!(await rateLimitAllowed(db, `events:${slug}`, 60, 60_000))) throw new HttpError(429, 'リクエストが多すぎます')
+    const body = analyticsEventSchema.safeParse(await json(c))
+    if (!body.success) throw new HttpError(400, 'イベントの形式が不正です')
+    // D-02: buttonId は公開版のボタン ID と照合する
+    let buttonId: string | null = null
+    if (body.data.type === 'cta_tap') {
+      const v = p.status === 'published' && p.published_scene_id ? await getSceneVersion(db, p.published_scene_id) : null
+      const ids = v ? parseScene(v.scene).buttons.map((b) => b.id) : []
+      if (!body.data.buttonId || !ids.includes(body.data.buttonId)) throw new HttpError(400, 'ボタン ID が不正です')
+      buttonId = body.data.buttonId
+    }
+    const now = new Date()
+    await db.query('INSERT INTO analytics_events (project_id, scene_version_id, type, button_id, os, occurred_at, day_jst) VALUES ($1, $2, $3, $4, $5, $6, $7)', [
+      p.id,
+      p.status === 'published' ? p.published_scene_id : null,
+      body.data.type,
+      buttonId,
+      body.data.os,
+      now.toISOString(),
+      toDayJst(now),
+    ])
+    return c.body(null, 204)
+  })
 
-  // ---- 掃除（Q4。Vercel Cron から GET。Authorization: Bearer <CRON_SECRET>）
-  app.get(
-    '/api/cron/cleanup',
-    wrap(async (req, res) => {
-      if (!config.cronSecret) throw new HttpError(503, 'CRON_SECRET が設定されていません')
-      const expected = Buffer.from(`Bearer ${config.cronSecret}`)
-      const given = Buffer.from(String(req.headers.authorization ?? ''))
-      if (expected.length !== given.length || !timingSafeEqual(expected, given)) throw new HttpError(401, '認証に失敗しました')
-      res.json(await runCleanup(db, storage))
-    }),
-  )
-
-  // ---- 素材配信（ローカル保存のみ。Blob は公開 URL から直接配信）
-  app.get(
-    '/a/:name',
-    wrap(async (req, res) => {
-      const name = String(req.params.name)
-      const a = await getAsset(db, name.split('.')[0])
-      if (!a || a.storage !== 'local' || a.url !== `/a/${name}` || !storage.localPath) {
-        res.status(404).end()
-        return
-      }
-      res.sendFile(storage.localPath(a.storage_key), {
-        headers: {
-          'Content-Type': a.mime,
-          'Cache-Control': 'public, max-age=31536000, immutable',
-          'X-Content-Type-Options': 'nosniff',
-          'Content-Disposition': 'inline',
-        },
-      })
-    }),
-  )
+  // ---- 掃除（Q4。Cloudflare では Cron Trigger（scheduled）が runCleanup を直接呼ぶ。HTTP 経路は Bearer 保護つきで残す）
+  app.get('/api/cron/cleanup', async (c) => {
+    if (!config.cronSecret) throw new HttpError(503, 'CRON_SECRET が設定されていません')
+    if (!safeEqual(String(c.req.header('authorization') ?? ''), `Bearer ${config.cronSecret}`)) throw new HttpError(401, '認証に失敗しました')
+    return c.json(await runCleanup(db, storage))
+  })
 
   // 未知の API パス（M-R3-04）
-  app.use('/api', (_req, res) => {
-    res.status(404).json({ error: 'ページが見つかりません' })
+  app.all('/api/*', (c) => c.json({ error: 'ページが見つかりません' }, 404))
+
+  // ---- 素材配信（ストレージから Range 対応で返す。ID は推測不能、公開 API は公開版の参照分しか返さない）
+  app.get('/a/:name', async (c) => {
+    const name = c.req.param('name')
+    const a = await getAsset(db, name.split('.')[0])
+    if (!a || a.url !== `/a/${name}`) return c.body(null, 404)
+    const stat = await storage.stat(a.storage_key)
+    if (!stat) return c.body(null, 404)
+    const range = parseRange(c.req.header('range'), stat.size)
+    const headers: Record<string, string> = {
+      'Content-Type': a.mime,
+      'Cache-Control': 'public, max-age=31536000, immutable',
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Disposition': 'inline',
+      'Accept-Ranges': 'bytes',
+    }
+    if (range === 'invalid') {
+      c.header('Content-Range', `bytes */${stat.size}`)
+      return c.body(null, 416)
+    }
+    const obj = await storage.get(a.storage_key, range ?? undefined)
+    if (!obj) return c.body(null, 404)
+    headers['Content-Length'] = String(obj.end - obj.start + 1)
+    if (range) headers['Content-Range'] = `bytes ${obj.start}-${obj.end}/${obj.size}`
+    if (a.kind === 'target_mind') headers['Content-Encoding'] = 'gzip' // 保存時に gzip 済み（D-19）。ブラウザが透過的に展開する
+    const status: 200 | 206 = range ? 206 : 200
+    return c.body(obj.body, status, headers)
   })
 
-  app.get('/healthz', (_req, res) => {
-    res.json({ ok: true, time: nowIso(), db: db.kind, storage: storage.kind })
-  })
-
-  // ---- フロントエンド（ビルド済み web/dist。Vercel では CDN が配信するためここは通らない）
-  const viewerHtml = path.join(config.webDist, 'viewer.html')
-  const indexHtml = path.join(config.webDist, 'index.html')
-  if (!config.isVercel && fs.existsSync(config.webDist)) {
-    app.use(
-      express.static(config.webDist, {
-        index: false,
-        maxAge: '1y',
-        setHeaders: (res, p) => {
-          if (p.endsWith('.html')) res.setHeader('Cache-Control', 'no-cache')
-        },
-      }),
-    )
-    app.get(['/v/:slug', '/p/:token'], (_req, res) => {
-      res.setHeader('Cache-Control', 'no-cache')
-      res.sendFile(viewerHtml)
-    })
-    app.get(/^\/(?!api\/|a\/).*/, (req, res, next) => {
-      if (!req.accepts('html')) return next()
-      res.setHeader('Cache-Control', 'no-cache')
-      res.sendFile(indexHtml)
-    })
-  }
+  app.get('/healthz', (c) => c.json({ ok: true, time: nowIso(), db: db.kind, storage: storage.kind }))
 
   // ---- エラーハンドラ
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.onError((err, c) => {
     if (err instanceof HttpError || err instanceof AssetError) {
-      res.status(err.status).json({ error: err.message, code: err instanceof AssetError ? err.code : undefined })
-      return
+      return c.json({ error: err.message, code: err instanceof AssetError ? err.code : undefined }, err.status as ContentfulStatusCode)
     }
-    if (err instanceof multer.MulterError) {
-      res.status(413).json({ error: 'ファイルが大きすぎます（動画 50 MB / 3D 20 MB / 画像 10 MB）', code: 'too_large' })
-      return
-    }
-    if (err instanceof SyntaxError && 'body' in (err as object)) {
-      res.status(400).json({ error: 'JSON の形式が不正です' })
-      return
-    }
-    if ((err as { type?: string }).type === 'entity.too.large') {
-      res.status(413).json({ error: '送信データが大きすぎます（1 MB まで）' }) // D-08
-      return
-    }
-    console.error(JSON.stringify({ level: 'error', time: nowIso(), message: (err as Error).message, stack: (err as Error).stack }))
-    res.status(500).json({ error: 'サーバーでエラーが発生しました' })
+    console.error(JSON.stringify({ level: 'error', time: nowIso(), message: err.message, stack: err.stack }))
+    return c.json({ error: 'サーバーでエラーが発生しました' }, 500)
   })
 
   return app
 }
+
+export type App = ReturnType<typeof createApp>

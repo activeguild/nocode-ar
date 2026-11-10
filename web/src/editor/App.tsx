@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState } from 'react'
 import { SERVICE_NAME } from '@shared/scene.ts'
-import { api, setUploadMode } from './api.ts'
+import { api } from './api.ts'
 import { EditorPage } from './pages/EditorPage.tsx'
 import { LoginPage } from './pages/LoginPage.tsx'
 import { ProjectsPage } from './pages/ProjectsPage.tsx'
@@ -27,10 +27,7 @@ export function App() {
 
   useEffect(() => {
     Promise.all([api.config().catch(() => null), api.me().catch(() => null)]).then(([c, m]) => {
-      if (c) {
-        setConfig(c)
-        setUploadMode(c.uploadMode ?? 'direct')
-      }
+      if (c) setConfig(c)
       setUser(m?.user ?? null)
       setReady(true)
     })

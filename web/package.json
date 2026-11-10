@@ -9,7 +9,6 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@vercel/blob": "^2.8.2",
     "mind-ar": "^1.2.5",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",

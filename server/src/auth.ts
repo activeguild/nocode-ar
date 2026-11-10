@@ -1,5 +1,6 @@
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
-import type { NextFunction, Request, Response } from 'express'
+import { Buffer } from 'node:buffer'
+import type { Context, MiddlewareHandler } from 'hono'
 import type { Db } from './db.js'
 import { nowIso, num, one } from './db.js'
 import { newId, newSessionId } from './ids.js'
@@ -11,7 +12,7 @@ const LOCK_MINUTES = 15
 /** D-21: ロック中も 60 秒に 1 回だけ照合を許可する */
 const LOCK_SLOW_INTERVAL_MS = 60_000
 
-// パスワードは scrypt（Node 組み込み。ネイティブ依存なし）
+// パスワードは scrypt（node:crypto。Cloudflare Workers の nodejs_compat でも利用可）
 export function hashPassword(password: string): string {
   const salt = randomBytes(16)
   const hash = scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 })
@@ -24,6 +25,13 @@ export function verifyPassword(password: string, stored: string): boolean {
   const expected = Buffer.from(hashB64, 'base64')
   const actual = scryptSync(password, Buffer.from(saltB64, 'base64'), expected.length, { N: 16384, r: 8, p: 1 })
   return timingSafeEqual(expected, actual)
+}
+
+/** 定数時間の文字列比較 */
+export function safeEqual(a: string, b: string): boolean {
+  const ba = Buffer.from(a)
+  const bb = Buffer.from(b)
+  return ba.length === bb.length && timingSafeEqual(ba, bb)
 }
 
 export function parseCookies(header: string | undefined): Record<string, string> {
@@ -42,12 +50,8 @@ export interface AuthUser {
   email: string
 }
 
-declare module 'express-serve-static-core' {
-  interface Request {
-    user?: AuthUser
-    sessionId?: string
-  }
-}
+export type AppVariables = { user?: AuthUser; sessionId?: string }
+export type AppContext = Context<{ Variables: AppVariables }>
 
 // ---- ログインロック（DB。サーバレスではプロセス内メモリに置けない）
 interface LockRow {
@@ -116,44 +120,41 @@ export function sessionCookie(id: string, secure: boolean, clear = false): strin
 }
 
 /** セッション Cookie からユーザーを解決する（認証必須ではない） */
-export function attachUser(db: Db) {
-  return (req: Request, _res: Response, next: NextFunction) => {
-    const sid = parseCookies(req.headers.cookie)[SESSION_COOKIE]
-    if (!sid) return next()
-    one<{ sid: string; id: string; email: string }>(
-      db,
-      'SELECT s.id AS sid, u.id AS id, u.email AS email FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = $1 AND s.expires_at > $2',
-      [sid, nowIso()],
-    )
-      .then((row) => {
-        if (row) {
-          req.user = { id: row.id, email: row.email }
-          req.sessionId = row.sid
-        }
-        next()
-      })
-      .catch(next)
+export function attachUser(db: Db): MiddlewareHandler<{ Variables: AppVariables }> {
+  return async (c, next) => {
+    const sid = parseCookies(c.req.header('cookie'))[SESSION_COOKIE]
+    if (sid) {
+      const row = await one<{ sid: string; id: string; email: string }>(
+        db,
+        'SELECT s.id AS sid, u.id AS id, u.email AS email FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = $1 AND s.expires_at > $2',
+        [sid, nowIso()],
+      )
+      if (row) {
+        c.set('user', { id: row.id, email: row.email })
+        c.set('sessionId', row.sid)
+      }
+    }
+    await next()
   }
 }
 
-export function requireAuth(req: Request, res: Response, next: NextFunction) {
-  if (!req.user) {
-    res.status(401).json({ error: 'ログインが必要です' })
-    return
-  }
-  next()
+export const requireAuth: MiddlewareHandler<{ Variables: AppVariables }> = async (c, next) => {
+  if (!c.get('user')) return c.json({ error: 'ログインが必要です' }, 401)
+  await next()
 }
 
 /** 状態変更リクエストの Origin 検査（NFR-9） */
-export function checkOrigin(req: Request, res: Response, next: NextFunction) {
-  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next()
-  const origin = req.headers.origin
-  if (!origin) return next() // ブラウザ以外（テスト・curl）
-  const hosts = [req.headers.host, req.headers['x-forwarded-host']].flat().filter(Boolean).map((h) => String(h).split(',')[0].trim())
-  try {
-    if (hosts.includes(new URL(origin).host)) return next()
-  } catch {
-    /* fallthrough */
+export function checkOrigin(trustProxy: boolean): MiddlewareHandler {
+  return async (c, next) => {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(c.req.method)) return next()
+    const origin = c.req.header('origin')
+    if (!origin) return next() // ブラウザ以外（テスト・curl）
+    const hosts = [c.req.header('host'), trustProxy ? c.req.header('x-forwarded-host') : undefined].filter(Boolean).map((h) => String(h).split(',')[0].trim())
+    try {
+      if (hosts.includes(new URL(origin).host)) return next()
+    } catch {
+      /* fallthrough */
+    }
+    return c.json({ error: '不正なリクエスト元です' }, 403)
   }
-  res.status(403).json({ error: '不正なリクエスト元です' })
 }

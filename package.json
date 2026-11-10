@@ -17,7 +17,9 @@
     "fixtures": "node scripts/gen-fixtures.mjs",
     "reset-password": "npm run reset-password -w server --",
     "migrate": "npm run migrate -w server --",
-    "vercel-build": "npm run build -w web"
+    "worker:dev": "wrangler dev",
+    "worker:dry-run": "npm run build -w web && wrangler deploy --dry-run --outdir dist-worker",
+    "worker:deploy": "npm run build -w web && wrangler deploy"
   },
   "overrides": {
     "canvas": "npm:empty-npm-package@1.0.0",
@@ -25,5 +27,8 @@
   },
   "engines": {
     "node": "22.x"
+  },
+  "devDependencies": {
+    "wrangler": "^4.159.0"
   }
 }

@@ -71,7 +71,7 @@ iOS Safari 必須（第 9 節）: 画像トラッキング方式は iOS Safari �
 | --- | --- |
 | フロントエンド（作成画面・閲覧ページ） | React 19 + Vite + TypeScript。3D 処理は three.js（model-viewer と同じ 0.183 系） |
 | 画像トラッキング | MindAR（`mind-ar` 1.2.5、MIT）。three.js ビルドを互換 shim 付きで使用。ターゲットデータ（`.mind`）の生成は **作成者のブラウザ内** で実行 |
-| バックエンド | Node 22 + Express 5。**本番は Vercel**（Functions + Neon PostgreSQL + Vercel Blob + Cron）。ローカル / テストは PGlite（WASM の Postgres）+ ローカルファイル。詳細は `04_architecture.md`「Vercel 構成」 |
+| バックエンド | **Hono**（Cloudflare Workers と Node で共通）。**本番は Cloudflare Workers + Neon PostgreSQL + R2**（Static Assets で画面配信、Cron Triggers で掃除）。ローカル / テストは Node + PGlite（WASM の Postgres）+ ローカルファイル。詳細は `04_architecture.md`「Cloudflare 構成」 |
 | QR 生成 | `qrcode`（サーバ側で PNG / SVG を生成） |
 | 認証 | メールアドレス + パスワードのセッション Cookie（§8.2 参照） |
 
@@ -203,7 +203,7 @@ iOS Safari 必須（第 9 節）: 画像トラッキング方式は iOS Safari �
 | NFR-2 | **パフォーマンス目標（体験者）**: (a) 導入画面の初期表示: 4G 相当（下り 10 Mbps、RTT 100 ms）で 2 秒以内、転送量 300 KB 以下。(b) 「カメラを起動」タップからカメラ映像表示まで 3 秒以内（ライブラリ + ターゲットデータ合計 gzip 後 600 KB 以下を目標）。(c) ターゲット認識: 20〜60 cm の距離・通常室内照明で 2 秒以内に初回認識。(d) 認識後のオーバーレイ表示: 画像 / 3D は即時、動画は 2 秒以内に再生開始（先読み済みの場合）。(e) 追従時 20 fps 以上（iPhone 11 / 同等 Android で） | K3「QR 読み取りから数秒以内」を具体化。(b)(c) は実機で QA 測定 |
 | NFR-3 | **パフォーマンス目標（作成者）**: ターゲットデータ生成 60 秒以内（1,024 px 画像、一般的な PC）。アップロードは 50 MB 動画で進捗表示あり | K7 30 分の内訳として、待ち時間の合計を 3 分以内に |
 | NFR-4 | **アセット上限**: ターゲット画像 10 MB、画像 10 MB、動画 50 MB、GLB 20 MB。1 プロジェクトの合計 100 MB、1 アカウントの合計 2 GB（環境変数 `ACCOUNT_QUOTA_BYTES` で変更可。D-06）。いずれも保存されている素材の合計で数える。差し替えで下書きにも公開版にも参照されなくなった素材は、アップロードから 15 分の猶予後に自動削除する（Q4） | K8、混雑回線での体験時間。GLB は Draco / KTX2 圧縮済みも受け付ける |
-| NFR-5 | **可用性・データ保全**: Vercel（Functions / CDN）+ Neon PostgreSQL + Vercel Blob のマネージド構成。データ保全は Neon のバックアップ / PITR と Blob の冗長化に依存。公開版シーン定義はイミュータブルで、差し替え前の版を 10 世代保持 | 展示会当日に体験が止まらないこと。ロールバック可能 |
+| NFR-5 | **可用性・データ保全**: Cloudflare Workers / Static Assets + Neon PostgreSQL + R2 のマネージド構成。データ保全は Neon のバックアップ / PITR と R2 の冗長化に依存。公開版シーン定義はイミュータブルで、差し替え前の版を 10 世代保持 | 展示会当日に体験が止まらないこと。ロールバック可能 |
 | NFR-6 | **プライバシー**: カメラ映像・フレーム・特徴点を一切サーバへ送信しない（ネットワーク送信するのは計測イベントのみ）。計測イベントは slug、種別、ボタン ID、OS 種別、タイムスタンプのみ。アクセスログ自体を出力しない（IP アドレスを残さない。Q5）。ログインロックはアカウント（メールアドレス）単位、計測 API のレート制限は slug 単位で、いずれも IP を保持しない。Cookie / ローカルストレージによる体験者の識別を **行わない**（ユニーク数は数えない。§8.2 D2）。利用規約・プライバシーポリシーの文面は未決事項 | K5、M7「個人情報は取得しない」 |
 | NFR-7 | **日本語 UI**: 作成画面・閲覧ページ・エラーメッセージ・メール文面はすべて日本語。文言は i18n 辞書（JSON）に外出しし、将来の多言語化（C3）を妨げない。閲覧ページの `lang="ja"` | K4 |
 | NFR-8 | **資産のロックイン回避**: アップロードされた素材は変換せず元形式のまま保存（縮小コピー・サムネイルは別途）。シーン定義のスキーマは `shared/src/scene.ts`（zod。型・既定値・検証の唯一の定義。Q18）。作成者がダウンロードする機能（S5）は MVP 外だが、API（`GET /api/projects/:id/export`）の実装は 1 日以内で追加できる構造にする | K6 |
@@ -271,10 +271,9 @@ AnalyticsEvent  id, projectId, sceneVersionId, type('page_open'|'blocked'|'view_
 | `GET /api/projects` | 要 | 一覧（累計計測値を含む） |
 | `POST /api/projects` | 要 | 作成（slug, previewToken を発行） |
 | `GET /api/projects/:id`, `PATCH /api/projects/:id`, `DELETE /api/projects/:id` | 要 | 取得、名前・印刷幅・下書きシーンの更新、削除 |
-| `POST /api/projects/:id/assets` (multipart: kind, file) | 要 | 直接アップロード（ローカル / 常駐構成）。検証（NFR-4, NFR-9） |
-| `POST /api/projects/:id/blob-upload` | 要 | Vercel Blob 直接アップロードのトークン発行（所有権・kind・パス・サイズ・Content-Type を検証） |
-| `POST /api/projects/:id/assets/register` | 要 | Blob に直接アップロードした素材の登録。`pathname`（自プロジェクト配下の規約に一致）を自ストアに照会してサーバ側の URL・サイズを得、先頭 64 KB を取得してマジックバイト・寸法・上限を検証。クライアントの `url` は照合のみで、取得・削除には使わない |
-| `GET /api/cron/cleanup` | Bearer `CRON_SECRET` | 未参照素材・迷子 Blob・期限切れセッションの掃除（Vercel Cron から呼ばれる） |
+| `POST /api/projects/:id/assets` | 要 | 素材のアップロード。multipart（kind, file, width, height, durationSec）または生ボディ（本体 = ファイル、`kind` 等はクエリ、`Content-Length` 必須）。鍵・URL はサーバ生成。保存後に先頭 64 KB を検証（NFR-4, NFR-9） |
+| `GET /a/:id.:ext` | 不要 | 素材配信（Range 対応、immutable キャッシュ）。`.mind` は `Content-Encoding: gzip` |
+| `GET /api/cron/cleanup` | Bearer `CRON_SECRET` | 掃除（Cloudflare では Cron Trigger の `scheduled()` が直接実行。HTTP 経路は任意） |
 | `DELETE /api/projects/:id/assets/:assetId` | 要 | 素材削除（公開版が参照中なら拒否） |
 | `POST /api/projects/:id/publish` | 要 | 公開 / 再公開（下書きのスナップショットを SceneVersion に保存） |
 | `POST /api/projects/:id/unpublish` | 要 | 停止 |
@@ -406,7 +405,7 @@ AnalyticsEvent  id, projectId, sceneVersionId, type('page_open'|'blocked'|'view_
 | Q1 | 削除は論理削除。削除後・停止後は「この AR は終了しました」+ 最後の公開版の行動ボタン・案内 URL（R1）。「ページが見つかりません」は存在しない slug のみ | FR-2-3, FR-7-8, `GET /api/public/:slug`（410 / 404） |
 | Q2 | 再開 = `POST /api/projects/:id/resume`。停止前の公開版にそのまま戻し、下書きは反映しない。PublishEvent.type は `resume`。停止中に下書きを反映したい場合は「下書きを公開」（= republish） | FR-6-9, §6.2 |
 | Q3 | 停止中・公開前・削除済みの slug に届いた計測イベントも受理する（`page_open` は終了・準備中画面でも送る。R2 の離脱分析に必要）。その場合 `scene_version_id` は null。`view_start` / `recognized` はカメラが起動しないため発生しない | FR-7-6 |
-| Q4 | 下書きにも公開版にも参照されない素材は、アップロードから 15 分の猶予後、**定期掃除（Vercel Cron → `GET /api/cron/cleanup`。常駐時は 15 分間隔）**で削除。DB に無い Blob も同時に削除。合計 100 MB は保存中の素材で数える。公開版が参照する素材の手動削除は 409 | NFR-4, `GET /api/cron/cleanup` |
+| Q4 | 下書きにも公開版にも参照されない素材は、アップロードから 15 分の猶予後、**定期掃除（Cloudflare Cron Trigger 15 分ごと → `scheduled()`。常駐時は 15 分間隔）**で削除。DB に無い R2 オブジェクトも同時に削除。合計 100 MB は保存中の素材で数える。公開版が参照する素材の手動削除は 409 | NFR-4 |
 | Q5 | アクセスログを出力しない（IP を保持しない）。ログインロックはアカウント単位（10 回で 15 分）、レート制限は slug 単位 | NFR-6, NFR-9 |
 | Q6 | 閲覧ページの初期転送量（実測、gzip）: HTML + viewer + 共通チャンク + three ≈ 254 KB、カメラ起動時に追加で MindAR ≈ 338 KB（合計 ≈ 592 KB、目標 600 KB 以下）。ターゲットデータは画像により 100〜300 KB 程度加算されるため、**600 KB は目標値**とし、超過は Minor として扱う | NFR-2(b) |
 | Q7, Q8, Q9 | 本環境では実機・テスターを用意できない。QA 計画の暫定扱いどおり（下限端末は未検証と明記、AC-K7 はオーナー判断、4G は実回線） | — |
@@ -498,3 +497,19 @@ Major D-01〜D-05 はすべて修正。Minor は D-10 / D-13 / D-19 / D-20 を�
 | M-R3-02 | `vercel.json` の headers に `/(v|p)/(.*)` → `Cache-Control: no-cache` を追加 |
 | M-R3-03 | マイグレーション SQL を `server/src/migrations.ts` に埋め込み（`.sql` と同一であることをテストで保証）。関数バンドルはファイルに依存しない |
 | M-R3-04 | Cron の Bearer 比較を `timingSafeEqual` に。未知の `/api/*` は日本語 JSON の 404 |
+
+---
+
+## 14. Cloudflare 構成への変更（2026-11-10）
+
+オーナー判断で本番基盤を Vercel から Cloudflare（Workers + Neon + R2）に変更した。機能要件・受け入れ基準に変更はない。
+
+| 項目 | 変更 | 要件への影響 |
+| --- | --- | --- |
+| 実行環境 | Vercel Functions（Express）→ Cloudflare Workers（**Hono**）。Node 常駐（ローカル / Docker）も同じ Hono アプリ | なし。全ルートの挙動・文言は同一（Vitest 56 件、E2E 24 ステップで確認） |
+| DB | Neon を継続。Workers からは HTTP クエリ（`@neondatabase/serverless`）。トランザクションは文の配列を 1 回で送る | なし（公開・停止・削除・再開の原子性は維持） |
+| 素材 | Vercel Blob（ブラウザ直接アップロード + 登録 API）→ **R2（Worker が本体を受けてストリーミング保存）**。鍵・URL はサーバ生成、配信は Worker 経由 `/a/<id>.<ext>`（Range 対応） | FR-3-2 / FR-4-2 / NFR-4 / NFR-9 の検証はサーバで同一基準。**B-R3-01 の原因となった「クライアントが鍵 / URL を申告する」経路を廃止**（`/assets/register`, `/blob-upload` は 404）。AC-K6: 元形式のまま保存（`.mind` のみ gzip 保存、配信時に透過展開） |
+| 配信・圧縮 | Cloudflare エッジが HTML / JS / CSS / JSON を圧縮。`.mind` は gzip 保存 + `Content-Encoding: gzip`（D-19 の改善） | NFR-2 の転送量目標に有利（`.mind` 約 550 KB → 約 250 KB） |
+| 掃除 | Vercel Cron（日次）→ Cron Triggers **15 分ごと** | Q4 の「猶予後、次の掃除で」が最大 30 分以内に |
+| 運用 | `wrangler secret put DATABASE_URL`、`npm run migrate`（Node から Neon へ）、`npm run worker:deploy`。`.dev.vars.example` / `.env.example` はキー名のみ | NFR-11 |
+| 撤去 | `vercel.json`、`api/`、`@vercel/*`、Express / multer / compression | — |

@@ -3,8 +3,9 @@
 // 新しいパスワードは対話入力（または環境変数 NEW_PASSWORD）で受け取り、引数には書かない（シェル履歴に残さないため）。
 import readline from 'node:readline/promises'
 import { hashPassword } from '../auth.js'
-import { loadConfig } from '../config.js'
-import { nowIso, one, openDb } from '../db.js'
+import { loadNodeConfig } from '../config-node.js'
+import { nowIso, one } from '../db.js'
+import { openNodeDb } from '../runtime-node.js'
 
 async function main() {
   const email = (process.argv[2] ?? '').trim().toLowerCase()
@@ -22,8 +23,7 @@ async function main() {
     console.error('パスワードは 8 文字以上にしてください')
     process.exit(2)
   }
-  const config = loadConfig()
-  const db = await openDb({ databaseUrl: config.databaseUrl, pgliteDir: config.pgliteDir })
+  const db = await openNodeDb(loadNodeConfig())
   try {
     const user = await one<{ id: string }>(db, 'SELECT id FROM users WHERE email = $1', [email])
     if (!user) {

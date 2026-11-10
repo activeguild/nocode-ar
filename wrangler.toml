@@ -1,0 +1,35 @@
+# Cloudflare Workers 設定（API + 静的配信 + R2 + Cron を 1 Worker に集約）
+name = "nocode-ar"
+main = "server/src/worker.ts"
+compatibility_date = "2026-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# 作成画面（index.html）と閲覧ページ（viewer.html）。run_worker_first で全リクエストを Worker が受け、
+# /api/*, /a/*, /healthz 以外は Worker から ASSETS.fetch() で配信する（/v/:slug → viewer.html、SPA フォールバック）
+[assets]
+directory = "./web/dist"
+binding = "ASSETS"
+run_worker_first = true
+not_found_handling = "none"
+# .html を付けた URL をそのまま配信（/legal.html → /legal の 307 を出さない）。/ と SPA の解決は Worker が行う
+html_handling = "none"
+
+# 素材（動画 / 画像 / GLB / .mind）。鍵は projects/<projectId>/<kind>/<id>
+[[r2_buckets]]
+binding = "ASSETS_BUCKET"
+bucket_name = "nocode-ar-assets"
+preview_bucket_name = "nocode-ar-assets-preview"
+
+# Q4: 未参照素材・期限切れセッションの掃除（15 分ごと）
+[triggers]
+crons = ["*/15 * * * *"]
+
+[observability]
+enabled = true
+
+# 秘密情報は wrangler secret put（DATABASE_URL, CRON_SECRET）。公開値だけを [vars] に置く
+[vars]
+SERVICE_NAME = "ARチラシ（仮）"
+# PUBLIC_ORIGIN = "https://ar.example.com"
+# SUPPORT_EMAIL = "support@example.com"
+# ACCOUNT_QUOTA_BYTES = "2147483648"

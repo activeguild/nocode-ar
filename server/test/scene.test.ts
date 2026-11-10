@@ -3,8 +3,7 @@ import { emptyScene, isAllowedButtonUrl, judgeTargetQuality, publishBlockers, sc
 import { detectFileType, imageDimensions, looksLikeMind, validateAsset } from '../src/assets.js'
 import { hashPassword, verifyPassword } from '../src/auth.js'
 import { newSlug, newToken } from '../src/ids.js'
-import { loadConfig } from '../src/config.js'
-import { createRuntime } from '../src/runtime.js'
+import { configFromEnv } from '../src/config.js'
 import { tinyGlb, tinyJpeg, tinyMind, tinyMp4, tinyPng } from './fixtures.js'
 
 describe('シーン定義', () => {
@@ -76,21 +75,14 @@ describe('認証ユーティリティ', () => {
   })
 })
 
-describe('Vercel 構成の設定', () => {
-  it('VERCEL=1 で必須の環境変数が無ければ明確なエラーになる', async () => {
-    const base = { VERCEL: '1', DATA_DIR: '/tmp/nocode-ar-test-cfg' }
-    await expect(createRuntime(loadConfig({ ...base }))).rejects.toThrow(/DATABASE_URL/)
-    await expect(createRuntime(loadConfig({ ...base, DATABASE_URL: 'postgres://user:pass@localhost:1/db' }))).rejects.toThrow(/BLOB_READ_WRITE_TOKEN/)
+describe('設定（configFromEnv）', () => {
+  it('Worker では Secure Cookie、圧縮なし、X-Forwarded を信頼しない', () => {
+    const c = configFromEnv({ DATABASE_URL: 'postgres://x', CRON_SECRET: 's' }, { runtime: 'worker' })
+    expect(c).toMatchObject({ cookieSecure: true, compressResponses: false, trustProxy: false, autoMigrate: false, databaseUrl: 'postgres://x' })
   })
-  it('設定の既定値（Vercel では Secure Cookie / trust proxy / 圧縮なし）', () => {
-    const c = loadConfig({ VERCEL: '1', DATABASE_URL: 'postgres://x', BLOB_READ_WRITE_TOKEN: 'vercel_blob_rw_dummy' })
-    expect(c.isVercel).toBe(true)
-    expect(c.cookieSecure).toBe(true)
-    expect(c.trustProxy).toBe(true)
-    expect(c.autoMigrate).toBe(false)
-    const local = loadConfig({})
-    expect(local.isVercel).toBe(false)
-    expect(local.autoMigrate).toBe(true)
-    expect(local.trustProxy).toBe('loopback')
+  it('Node ローカルでは PGlite 自動マイグレーション、圧縮あり', () => {
+    const c = configFromEnv({}, { runtime: 'node' })
+    expect(c).toMatchObject({ cookieSecure: false, compressResponses: true, trustProxy: true, autoMigrate: true, databaseUrl: null })
+    expect(configFromEnv({ TRUST_PROXY: 'false' }, { runtime: 'node' }).trustProxy).toBe(false)
   })
 })

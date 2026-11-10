@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto'
+import { Buffer } from 'node:buffer'
+import { gzipSync } from 'node:zlib'
 import { LIMITS, type AssetInfo, type AssetKind } from '../../shared/src/index.js'
 import type { Db, Queryable } from './db.js'
 import { all, nowIso, num, one } from './db.js'
 import { newId } from './ids.js'
-import { isValidKey, type Storage } from './storage.js'
+import { readHead, type Storage } from './storage.js'
 
 export interface Detected {
   mime: string
@@ -94,12 +96,12 @@ export class AssetError extends Error {
   }
 }
 
-/** 種類ごとの上限と許可 MIME（Blob クライアントアップロードのトークン発行にも使う） */
-export const KIND_LIMITS: Record<AssetKind, { maxBytes: number; contentTypes: string[] }> = {
-  target_image: { maxBytes: LIMITS.targetImageBytes, contentTypes: ['image/png', 'image/jpeg'] },
-  thumbnail: { maxBytes: LIMITS.imageBytes, contentTypes: ['image/png', 'image/jpeg', 'image/webp'] },
-  overlay: { maxBytes: LIMITS.videoBytes, contentTypes: ['video/mp4', 'image/png', 'image/jpeg', 'image/webp', 'model/gltf-binary', 'application/octet-stream'] },
-  target_mind: { maxBytes: LIMITS.mindBytes, contentTypes: ['application/octet-stream'] },
+/** 種類ごとの受け入れ上限（本文サイズの事前チェックに使う。最終判定は validateAsset） */
+export const KIND_MAX_BYTES: Record<AssetKind, number> = {
+  target_image: LIMITS.targetImageBytes,
+  thumbnail: LIMITS.imageBytes,
+  overlay: LIMITS.videoBytes,
+  target_mind: LIMITS.mindBytes,
 }
 
 export interface Validated {
@@ -111,7 +113,7 @@ export interface Validated {
 
 /**
  * 先頭バイト列（head）と全体サイズから、種類・上限・寸法を検証する。
- * 直接アップロード（本体全体）と Blob 登録（先頭 64 KB のレンジ取得）の両方で使う。
+ * 本体全体（Buffer）でも、ストレージに保存後の先頭 64 KB でも同じ関数で判定する。
  */
 export function validateAsset(kind: AssetKind, head: Buffer, size: number, hint: { width?: number | null; height?: number | null } = {}): Validated {
   let width = hint.width ?? null
@@ -183,53 +185,10 @@ export interface SaveAssetInput {
   userId: string
   accountQuotaBytes: number
   kind: AssetKind
-  buffer: Buffer
-  width?: number | null
-  height?: number | null
-  durationSec?: number | null
-}
-
-/** 直接アップロード（multipart）: 本体全体を検証してストレージに保存する */
-export async function saveAsset(db: Db, storage: Storage, input: SaveAssetInput): Promise<AssetRow> {
-  const { projectId, kind, buffer } = input
-  const v = validateAsset(kind, buffer, buffer.length, input)
-  await checkQuotas(db, projectId, input.userId, input.accountQuotaBytes, buffer.length)
-  const id = newId()
-  const stored = await storage.put(`projects/${projectId}/${kind}/${id}.${v.ext}`, buffer, v.mime)
-  const row: AssetRow = {
-    id,
-    project_id: projectId,
-    kind,
-    mime: v.mime,
-    ext: v.ext,
-    size_bytes: buffer.length,
-    storage: storage.kind,
-    storage_key: stored.key,
-    url: stored.url,
-    width: v.width,
-    height: v.height,
-    duration_sec: input.durationSec ?? null,
-    sha256: createHash('sha256').update(buffer).digest('hex'),
-    created_at: nowIso(),
-  }
-  try {
-    await insertAsset(db, row)
-  } catch (e) {
-    await storage.delete(stored.key).catch(() => {})
-    throw e
-  }
-  return row
-}
-
-export interface RegisterAssetInput {
-  projectId: string
-  userId: string
-  accountQuotaBytes: number
-  kind: AssetKind
-  /** クライアントが申告した pathname（自プロジェクト配下の規約に一致することを必須とする） */
-  key: string
-  /** クライアントが申告した URL（任意）。ストアが返す URL と一致しなければ拒否。取得・削除には一切使わない */
-  url?: string | null
+  /** 本体。ストリームの場合は size（Content-Length）必須 */
+  body: Buffer | ReadableStream<Uint8Array>
+  size: number
+  contentTypeHint?: string | null
   width?: number | null
   height?: number | null
   durationSec?: number | null
@@ -238,52 +197,62 @@ export interface RegisterAssetInput {
 const HEAD_BYTES = 64 * 1024
 
 /**
- * クライアントが Blob に直接アップロードした素材を登録する（B-R3-01 対応）。
- * - pathname は `projects/<projectId>/<kind>/<name>` に一致する自プロジェクトのものだけ受け付ける
- * - メタデータと URL は自ストアを pathname で照会した結果（storage.stat）をサーバ側の正とし、クライアントの url は照合にしか使わない
- * - 先頭 64 KB をレンジ取得して形式・寸法・上限を検証する。失敗した場合に削除するのは、この自プロジェクト配下の pathname のみ
+ * 素材を保存する。鍵（projects/<projectId>/<kind>/<id>）と配信 URL（/a/<id>.<ext>）はサーバが生成し、
+ * クライアントからは本体とメタデータだけを受け取る。
+ * - Buffer: 先に検証してから保存。ターゲットデータ（.mind、msgpack）は gzip して保存し、配信時に Content-Encoding: gzip を付ける
+ *   （CDN は application/octet-stream を圧縮しないため。D-19 / NFR-2(b)）
+ * - ストリーム（大きな動画）: 保存してから先頭 64 KB を読み戻して検証。失敗したら削除
  */
-export async function registerUploadedAsset(db: Db, storage: Storage, input: RegisterAssetInput): Promise<AssetRow> {
-  const { projectId, kind, key } = input
-  const prefix = `projects/${projectId}/${kind}/`
-  if (!isValidKey(key) || !key.startsWith(prefix)) throw new AssetError(400, '素材のパスが不正です')
-  const stat = await storage.stat(key)
-  if (!stat) throw new AssetError(400, 'アップロードされた素材が見つかりません')
-  if (stat.key !== key) throw new AssetError(400, '素材のパスが一致しません')
-  if (input.url && input.url !== stat.url) throw new AssetError(400, '素材の URL が一致しません')
-  const fail = async (e: unknown) => {
-    await storage.delete(key).catch(() => {})
-    throw e
-  }
-  let v: Validated
-  try {
-    const bytes = await storage.readRange(key, 0, Math.min(HEAD_BYTES, Math.max(stat.size, 1)) - 1)
-    v = validateAsset(kind, bytes, stat.size, input)
-    await checkQuotas(db, projectId, input.userId, input.accountQuotaBytes, stat.size)
-  } catch (e) {
-    return fail(e)
-  }
+export async function saveAsset(db: Db, storage: Storage, input: SaveAssetInput): Promise<AssetRow> {
+  const { projectId, kind, body, size } = input
+  if (size > KIND_MAX_BYTES[kind]) throw new AssetError(413, 'ファイルが大きすぎます（動画 50 MB / 3D 20 MB / 画像 10 MB）', 'too_large')
+  await checkQuotas(db, projectId, input.userId, input.accountQuotaBytes, size)
   const id = newId()
+  const key = `projects/${projectId}/${kind}/${id}`
+  let v: Validated
+  let sha256: string | null = null
+  let storedSize = size
+  if (Buffer.isBuffer(body)) {
+    v = validateAsset(kind, body, body.length, input)
+    sha256 = createHash('sha256').update(body).digest('hex')
+    const stored = kind === 'target_mind' ? gzipSync(body) : body
+    storedSize = stored.length
+    await storage.put(key, stored, v.mime, stored.length)
+  } else {
+    if (kind === 'target_mind') throw new AssetError(400, 'ターゲットデータは本体をまとめて送信してください')
+    await storage.put(key, body, input.contentTypeHint || 'application/octet-stream', size)
+    try {
+      const stat = await storage.stat(key)
+      if (!stat) throw new AssetError(400, '素材を保存できませんでした')
+      const head = await readHead(storage, key, Math.min(HEAD_BYTES, Math.max(stat.size, 1)))
+      v = validateAsset(kind, head, stat.size, input)
+      await checkQuotas(db, projectId, input.userId, input.accountQuotaBytes, stat.size)
+    } catch (e) {
+      await storage.delete(key).catch(() => {})
+      throw e
+    }
+  }
   const row: AssetRow = {
     id,
     project_id: projectId,
     kind,
     mime: v.mime,
     ext: v.ext,
-    size_bytes: stat.size,
+    size_bytes: storedSize,
     storage: storage.kind,
     storage_key: key,
-    url: stat.url,
+    url: `/a/${id}.${v.ext}`,
     width: v.width,
     height: v.height,
     duration_sec: input.durationSec ?? null,
-    sha256: null, // 先頭のみ取得するため全体のハッシュは持たない
+    sha256,
     created_at: nowIso(),
   }
   try {
     await insertAsset(db, row)
   } catch (e) {
-    return fail(e)
+    await storage.delete(key).catch(() => {})
+    throw e
   }
   return row
 }
@@ -296,7 +265,7 @@ export async function listAssets(db: Queryable, projectId: string): Promise<Asse
   return all<AssetRow>(db, 'SELECT * FROM assets WHERE project_id = $1 ORDER BY created_at', [projectId])
 }
 
-/** DB に登録済みの素材だけを、その storage_key で削除する（URL では削除しない） */
+/** DB に登録済みの素材だけを、その storage_key で削除する */
 export async function deleteAsset(db: Queryable, storage: Storage, a: AssetRow) {
   await db.query('DELETE FROM assets WHERE id = $1', [a.id])
   await storage.delete(a.storage_key).catch(() => {})

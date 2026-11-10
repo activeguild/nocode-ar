@@ -1,71 +1,132 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
+import { parseRange } from '../src/app.js'
+import { createNeonDb, type NeonSql } from '../src/db-neon.js'
 import { MIGRATIONS } from '../src/migrations.js'
-import { createBlobStorage, isBlobUrl, isValidKey } from '../src/storage.js'
+import { createR2Storage, createMemoryStorage, isValidKey, readHead, type R2BucketLike } from '../src/storage.js'
 
-const STORE = 'https://abc123.public.blob.vercel-storage.com'
-const headMock = vi.fn()
-const delMock = vi.fn()
-class BlobNotFoundError extends Error {}
-vi.mock('@vercel/blob', () => ({
-  head: (...a: unknown[]) => headMock(...a),
-  del: (...a: unknown[]) => delMock(...a),
-  put: vi.fn(),
-  list: vi.fn(),
-  BlobNotFoundError,
-}))
+/** R2 バインディングの最小フェイク（put / head / get(range) / delete / list） */
+function fakeBucket() {
+  const store = new Map<string, { body: Uint8Array; contentType?: string; uploaded: Date }>()
+  const calls: string[] = []
+  const bucket: R2BucketLike = {
+    async put(key, value, options) {
+      calls.push(`put:${key}`)
+      const body = value instanceof ReadableStream ? new Uint8Array(await new Response(value).arrayBuffer()) : typeof value === 'string' ? new TextEncoder().encode(value) : new Uint8Array(value as ArrayBuffer)
+      store.set(key, { body, contentType: options?.httpMetadata?.contentType, uploaded: new Date() })
+    },
+    async head(key) {
+      const o = store.get(key)
+      return o ? { size: o.body.length, uploaded: o.uploaded, httpMetadata: { contentType: o.contentType } } : null
+    },
+    async get(key, options) {
+      const o = store.get(key)
+      if (!o) return null
+      const offset = options?.range?.offset ?? 0
+      const length = options?.range?.length ?? o.body.length - offset
+      return { body: new Blob([o.body.subarray(offset, offset + length)]).stream() as ReadableStream<Uint8Array>, size: o.body.length }
+    },
+    async delete(keys) {
+      for (const k of Array.isArray(keys) ? keys : [keys]) {
+        calls.push(`delete:${k}`)
+        store.delete(k)
+      }
+    },
+    async list(options) {
+      const keys = [...store.keys()].filter((k) => k.startsWith(options?.prefix ?? '')).sort()
+      const limit = options?.limit ?? 1000
+      const startIdx = options?.cursor ? Number(options.cursor) : 0
+      const page = keys.slice(startIdx, startIdx + limit)
+      const truncated = startIdx + limit < keys.length
+      return { objects: page.map((k) => ({ key: k, size: store.get(k)!.body.length, uploaded: store.get(k)!.uploaded })), truncated, cursor: truncated ? String(startIdx + limit) : undefined }
+    },
+  }
+  return { bucket, store, calls }
+}
 
-describe('Vercel Blob アダプタ（B-R3-01）', () => {
-  afterEach(() => vi.restoreAllMocks())
-
-  it('stat は pathname で自ストアを照会し、URL は SDK の結果を正とする', async () => {
-    headMock.mockImplementation(async (key: string) => {
-      if (key !== 'projects/p1/overlay/a-xyz.png') throw new BlobNotFoundError('not found')
-      return { url: `${STORE}/projects/p1/overlay/a-xyz.png`, pathname: key, size: 123, contentType: 'image/png', uploadedAt: new Date(0) }
-    })
-    const s = createBlobStorage('vercel_blob_rw_dummy')
-    const st = await s.stat('projects/p1/overlay/a-xyz.png')
-    expect(st).toMatchObject({ key: 'projects/p1/overlay/a-xyz.png', url: `${STORE}/projects/p1/overlay/a-xyz.png`, size: 123 })
-    expect(headMock).toHaveBeenCalledWith('projects/p1/overlay/a-xyz.png', { token: 'vercel_blob_rw_dummy' })
-    expect(await s.stat('projects/p1/overlay/missing.png')).toBeNull()
-    // 規約外の key は SDK を呼ばずに null
-    headMock.mockClear()
-    expect(await s.stat('http://127.0.0.1/evil.png')).toBeNull()
-    expect(await s.stat('projects/p1/overlay/../../etc/passwd')).toBeNull()
-    expect(headMock).not.toHaveBeenCalled()
+describe('R2 アダプタ', () => {
+  it('put / stat / get(range) / delete / list（ページング）', async () => {
+    const { bucket, calls } = fakeBucket()
+    const s = createR2Storage(bucket)
+    const key = 'projects/p1/overlay/abc'
+    await s.put(key, Buffer.from('0123456789'), 'image/png', 10)
+    expect(await s.stat(key)).toMatchObject({ key, size: 10, contentType: 'image/png' })
+    const part = await s.get(key, { start: 2, end: 5 })
+    expect(part && [part.start, part.end, part.size]).toEqual([2, 5, 10])
+    expect(await new Response(part!.body).text()).toBe('2345')
+    expect(await readHead(s, key, 4)).toEqual(Buffer.from('0123'))
+    // ストリーム put（Node では FixedLengthStream が無いためバッファリングされる）
+    await s.put('projects/p1/overlay/stream', new Blob(['hello']).stream() as ReadableStream<Uint8Array>, 'text/plain', 5)
+    expect((await s.stat('projects/p1/overlay/stream'))?.size).toBe(5)
+    // 規約外の key は触らない
+    expect(await s.stat('../etc/passwd')).toBeNull()
+    expect(await s.get('http://127.0.0.1/x')).toBeNull()
+    await s.delete('not/a/valid/key')
+    expect(calls.filter((c) => c.startsWith('delete:'))).toEqual([])
+    await s.delete(key)
+    expect(await s.stat(key)).toBeNull()
+    // list のページング（limit は fake の実装で 1000 固定だが cursor の扱いを確認）
+    for (let i = 0; i < 3; i++) await s.put(`projects/p2/overlay/k${i}`, Buffer.from('x'), 'text/plain', 1)
+    const listed = await s.list!('projects/p2/')
+    expect(listed.map((o) => o.key).sort()).toEqual(['projects/p2/overlay/k0', 'projects/p2/overlay/k1', 'projects/p2/overlay/k2'])
   })
 
-  it('readRange は SDK が返した Blob URL だけを fetch し、delete は pathname 指定で行う', async () => {
-    headMock.mockImplementation(async (key: string) => ({ url: `${STORE}/${key}`, pathname: key, size: 10, contentType: 'image/png', uploadedAt: new Date(0) }))
-    const fetched: string[] = []
-    const fakeFetch = (async (url: string | URL | Request) => {
-      fetched.push(String(url))
-      return new Response(new Uint8Array([1, 2, 3, 4]), { status: 206 })
-    }) as typeof fetch
-    const s = createBlobStorage('tkn', fakeFetch)
-    const buf = await s.readRange('projects/p1/overlay/a.png', 0, 3)
-    expect([...buf]).toEqual([1, 2, 3, 4])
-    expect(fetched).toEqual([`${STORE}/projects/p1/overlay/a.png`])
-    // SDK が Blob 以外の URL を返した場合は fetch しない
-    headMock.mockImplementationOnce(async (key: string) => ({ url: 'http://127.0.0.1/x', pathname: key, size: 1, contentType: null, uploadedAt: null }))
-    await expect(s.readRange('projects/p1/overlay/b.png', 0, 0)).rejects.toThrow()
-    expect(fetched).toHaveLength(1)
-    await s.delete('projects/p1/overlay/a.png')
-    expect(delMock).toHaveBeenCalledWith('projects/p1/overlay/a.png', { token: 'tkn' })
-    delMock.mockClear()
-    await s.delete(`${STORE}/projects/p1/overlay/a.png`) // URL は key として無効 → 何もしない
-    expect(delMock).not.toHaveBeenCalled()
+  it('メモリアダプタも同じ契約', async () => {
+    const s = createMemoryStorage()
+    await s.put('projects/p1/overlay/a', Buffer.from('abcdef'), 'text/plain')
+    const g = await s.get('projects/p1/overlay/a', { start: 1, end: 3 })
+    expect(await new Response(g!.body).text()).toBe('bcd')
+    expect(await s.get('projects/p1/overlay/none')).toBeNull()
   })
 
-  it('isBlobUrl / isValidKey', () => {
-    expect(isBlobUrl(`${STORE}/x.png`)).toBe(true)
-    expect(isBlobUrl('https://evil.example.com/x.png')).toBe(false)
-    expect(isBlobUrl('http://abc.public.blob.vercel-storage.com/x')).toBe(false)
+  it('isValidKey', () => {
     expect(isValidKey('projects/AbC123/overlay/a-b_c.png')).toBe(true)
     expect(isValidKey('projects/AbC123/overlay/')).toBe(false)
     expect(isValidKey('projects/AbC123/overlay/a/b.png')).toBe(false)
     expect(isValidKey('other/x/y/z')).toBe(false)
+  })
+})
+
+describe('Range ヘッダ', () => {
+  it('解釈と不正値', () => {
+    expect(parseRange(undefined, 100)).toBeNull()
+    expect(parseRange('bytes=0-9', 100)).toEqual({ start: 0, end: 9 })
+    expect(parseRange('bytes=90-', 100)).toEqual({ start: 90, end: 99 })
+    expect(parseRange('bytes=-10', 100)).toEqual({ start: 90, end: 99 })
+    expect(parseRange('bytes=0-500', 100)).toEqual({ start: 0, end: 99 })
+    expect(parseRange('bytes=100-', 100)).toBe('invalid')
+    expect(parseRange('bytes=5-2', 100)).toBe('invalid')
+    expect(parseRange('items=0-1', 100)).toBe('invalid')
+  })
+})
+
+describe('Neon HTTP アダプタ', () => {
+  it('tx はコールバック内の文を集めて 1 回の transaction として送る', async () => {
+    const executed: string[] = []
+    const sql: NeonSql = {
+      query(text) {
+        const p = { then: (res: (v: { rows: unknown[] }) => void) => res({ rows: [{ text }] }) } as unknown as PromiseLike<{ rows: unknown[] }> & { text: string }
+        ;(p as { text: string }).text = text
+        return p
+      },
+      async transaction(queries) {
+        executed.push(...queries.map((q) => (q as unknown as { text: string }).text))
+        return []
+      },
+    }
+    const db = createNeonDb(sql)
+    expect(db.kind).toBe('neon')
+    const r = await db.query('SELECT 1')
+    expect(r.rows).toEqual([{ text: 'SELECT 1' }])
+    const out = await db.tx(async (q) => {
+      await q.query('INSERT 1')
+      await q.query('UPDATE 2')
+      return 'done'
+    })
+    expect(out).toBe('done')
+    expect(executed).toEqual(['INSERT 1', 'UPDATE 2'])
+    await expect(db.exec('CREATE TABLE x (a int); CREATE TABLE y (b int)')).rejects.toThrow(/npm run migrate/)
   })
 })
 

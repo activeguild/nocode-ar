@@ -11,3 +11,6 @@ e2e/.out/
 .env
 .DS_Store
 .vercel/
+.dev.vars
+.wrangler/
+dist-worker/

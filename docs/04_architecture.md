@@ -235,7 +235,16 @@ WebAR の技術選定は、ライブラリより先に **iOS と Android のブ�
 
 ---
 
-## Vercel 構成（2026-11-09、オーナー判断による載せ替え）
+## Cloudflare 構成（2026-11-10、オーナー判断による載せ替え。Vercel 構成を置換）
+
+### Vercel から変えた理由
+
+| 観点 | Vercel（旧） | Cloudflare（新） |
+| --- | --- | --- |
+| 素材の下り転送 | Blob の帯域が課金対象（体験回数 × 動画サイズ） | **R2 は下り転送（egress）無料**。Worker 経由配信の Worker リクエスト課金のみ |
+| アップロードの本文上限 | Functions 4.5 MB → ブラウザから Blob へ直接アップロード + 登録 API（B-R3-01 の原因になった構造） | Workers は 100 MB（Free）→ **Worker が直接受けて R2 へストリーミング**。クライアントから鍵 / URL を受け取らない |
+| 掃除（Q4）の頻度 | Hobby は Cron 1 日 1 回 | Cron Triggers は Free でも **15 分ごと** |
+| 商用利用 | Hobby は非商用 | Workers Free から商用利用可 |
 
 ### 全体図
 
@@ -243,58 +252,64 @@ WebAR の技術選定は、ライブラリより先に **iOS と Android のブ�
  [作成者のブラウザ]                        [体験者のスマホ]
    作成画面 (index.html)                    閲覧ページ (viewer.html)
       │ /api/*  (JSON)                         │ /api/public/:slug, /api/public/:slug/events
-      │ 素材: @vercel/blob/client で直接 PUT    │ 素材: Blob の公開 URL から直接 GET
+      │ 素材: POST /api/projects/:id/assets     │ 素材: GET /a/<id>.<ext>（Range 対応）
+      │       （本体 + Content-Length）         │
       ▼                                        ▼
- ┌──────────────────────────── Vercel ────────────────────────────┐
- │ CDN / 静的配信: web/dist（index.html, viewer.html, assets/*）  │
- │   rewrites: /v/:slug,/p/:token → viewer.html, その他 → index   │
- │ Function: api/index.ts（Express 1 本）                          │
- │   /api/*, /a/*（ローカル配信用、Vercel では未使用）, /healthz   │
- │ Cron: 0 3 * * * → GET /api/cron/cleanup (Bearer CRON_SECRET)  │
- └───────────┬──────────────────────────┬────────────────────────┘
-             │ pg Pool（attachDatabasePool）│ @vercel/blob（put/del/list/HEAD/Range）
-             ▼                              ▼
-      Neon PostgreSQL                   Vercel Blob（public, addRandomSuffix）
-      users / sessions / projects /     projects/<projectId>/<kind>/<name>-<random>.<ext>
-      assets / scene_versions /
-      publish_events / analytics_events /
-      login_locks / rate_limits
+ ┌──────────────────────── Cloudflare Workers（1 Worker）───────────────────────┐
+ │ fetch(): /api/*, /a/*, /healthz → Hono アプリ（server/src/app.ts）           │
+ │          それ以外 → Static Assets（web/dist）: /v/:slug,/p/:token → viewer.html, │
+ │          未知の HTML 要求 → index.html, /assets/* immutable, nosniff            │
+ │ scheduled(): Cron Trigger */15 * * * * → runCleanup                          │
+ └────────────┬──────────────────────────────┬─────────────────────────────────┘
+              │ @neondatabase/serverless（HTTP）  │ R2 バインディング ASSETS_BUCKET
+              ▼                                  ▼
+       Neon PostgreSQL                     R2 バケット nocode-ar-assets
+       users / sessions / projects /       projects/<projectId>/<kind>/<id>
+       assets / scene_versions /           （鍵はサーバ生成。.mind は gzip 保存）
+       publish_events / analytics_events /
+       login_locks / rate_limits
 ```
 
 ### 実装の要点
 
 | 項目 | 内容 |
 | --- | --- |
-| Function | `api/index.ts` → `server/src/vercel.ts`。コールドスタート時に 1 回だけ DB 接続・アプリ生成（`getRuntime()`）。`vercel.json` で `maxDuration: 30`, `memory: 1024`。本文上限 4.5 MB のため大きな素材は Blob 直接アップロード |
-| DB アダプタ | `server/src/db.ts`。`DATABASE_URL` があれば `pg`（Pool max 5。Vercel では `@vercel/functions` の `attachDatabasePool` で Fluid compute の接続再利用）、無ければ `@electric-sql/pglite`（ローカル: `data/pglite`、テスト: インメモリ）。同じ SQL（`$1` プレースホルダ）で動く。pg は COUNT/SUM を文字列で返すため `num()` で数値化 |
-| マイグレーション | `server/migrations/*.sql` を `schema_migrations` で管理。関数バンドルがファイルに依存しないよう、同じ SQL を `server/src/migrations.ts` に埋め込み（テストで同一性を検証）。`npm run migrate`（PGlite は起動時に自動、PostgreSQL は `AUTO_MIGRATE=1` のときのみ自動） |
-| プロセス内状態の排除 | ログインロック → `login_locks`、レート制限（slug ごと 60/分）→ `rate_limits`（`INSERT ... ON CONFLICT` で原子的に加算）、セッションは従来どおり `sessions` |
-| 素材ストレージ | `server/src/storage.ts` の `Storage` アダプタ（`put / delete / head / readRange / list`）。`local`（ファイル、`/a/<id>.<ext>` で配信）/ `blob`（Vercel Blob）/ `memory`（テスト）。`BLOB_READ_WRITE_TOKEN` の有無で切替 |
-| アップロード | ブラウザ → `POST /api/projects/:id/blob-upload`（`handleUpload`: 所有者・kind・種別（video / image / model）ごとの `maximumSizeInBytes` と `allowedContentTypes`・`projects/<id>/<kind>/` パス・`addRandomSuffix` を検証してトークン発行）→ Blob へ直接 PUT（8 MB 超は multipart）→ `POST /api/projects/:id/assets/register`。**サーバはクライアントの `url` を信用せず**、`pathname` が自プロジェクトの規約（`projects/<id>/<kind>/<name>`）に一致することを必須にし、`@vercel/blob` の `head(pathname, {token})` で自ストアを照会した結果（URL・サイズ）を正とする（クライアントの `url` は照合のみ）。その URL に対してだけ先頭 64 KB をレンジ取得し、マジックバイト・寸法・上限・容量を検証。失敗時に削除するのも自プロジェクト配下の pathname のみ（B-R3-01）。完了 Webhook（`onUploadCompleted`）はローカルで届かないため使わない。登録前に離脱した Blob は Cron の掃除で削除 |
-| D-01 の維持 | 公開 API は公開版が参照する素材の URL のみ返す。Blob URL は `addRandomSuffix` で推測不能 |
-| 圧縮 | Vercel CDN が gzip / brotli を自動適用（Functions の応答も対象）。`isVercel` のとき Express の `compression` は無効 |
-| 掃除（Q4） | `GET /api/cron/cleanup`（`CRON_SECRET`）。未参照素材（15 分猶予）、DB に無い Blob、期限切れセッション、古いロック / レート制限行。常駐時は 15 分間隔の `setInterval` でも実行 |
-| 静的配信 | `outputDirectory: web/dist`。Vercel は filesystem を先に見るため、`/assets/*` 等の実ファイルは rewrites より優先される |
+| フレームワーク | Express → **Hono**。`createApp()` が Workers と Node（`@hono/node-server`）で同じアプリを返す。ルート・検証（zod、マジックバイト、寸法、scrypt、セッション Cookie、Origin 検査、ロック・レート制限）は挙動を変えずに移植 |
+| Worker エントリ | `server/src/worker.ts`。`fetch` は API パスなら Hono、他は `ASSETS.fetch()`。`scheduled` は `runCleanup`。初回リクエストで DB / R2 / アプリを 1 回だけ組み立てる |
+| DB アダプタ | `db.ts`（共通 I/F）+ `db-neon.ts`（Workers: `neon(url, {fullResults: true})` の HTTP クエリ。`tx` はコールバック内の文を集めて `sql.transaction([...])` で 1 回送る。`exec`（複数文）は非対応で、マイグレーションは Node から）+ `db-pg.ts`（Node → PostgreSQL。CLI / Docker）+ `db-pglite.ts`（ローカル・テスト） |
+| 素材 | `storage.ts` の `Storage`（`put / stat / get(range) / delete / list`）を R2（`createR2Storage`）/ メモリ / ローカルファイル（`storage-local.ts`）で実装。アップロードは multipart（小さいファイル・テスト）と生ボディ（本番の Web クライアント。`Content-Length` 必須、R2 へ `FixedLengthStream` でストリーミング）。保存後に先頭 64 KB を読み戻して `validateAsset`（形式・寸法・上限・容量）、失敗時は削除。`.mind` は gzip して保存し `Content-Encoding: gzip` で配信（D-19） |
+| B-R3-01 の構造的防止 | クライアントから鍵・URL・pathname を受け取る API を廃止（`/assets/register`, `/blob-upload` は 404）。鍵は `projects/<pid>/<kind>/<22 文字乱数>`、URL は `/a/<id>.<ext>` をサーバが生成。削除は DB の `storage_key` のみ |
+| 配信 | `/a/:id.ext` は DB の URL と一致する素材のみ、`storage.get(key, range)` で 200 / 206 / 416。`Cache-Control: immutable`、`Accept-Ranges`、`nosniff`。D-01（公開 API は公開版の参照分のみ）は維持。ID は 131 bit の乱数で推測不能 |
+| 静的配信 | `wrangler.toml` `[assets] directory = web/dist, binding = ASSETS, run_worker_first = true, not_found_handling = none, html_handling = none`。`/` と SPA フォールバック、`/v/` `/p/` の viewer.html 解決、ヘッダ付与は Worker 側 |
+| 圧縮 | Cloudflare エッジが自動（gzip / brotli）。`compressResponses = false`。Node 常駐時のみ Hono `compress` |
+| 掃除 | `[triggers] crons = ["*/15 * * * *"]` → `scheduled()`。HTTP の `/api/cron/cleanup` は Bearer（定数時間比較）で残置 |
+| 状態 | ログインロック → `login_locks`、レート制限 → `rate_limits`、セッション → `sessions`（Vercel 構成から継続） |
+| 設定 | `config.ts`（ランタイム非依存。`configFromEnv(env, {runtime})`）と `config-node.ts`（パス等）。Worker は `env`（vars + secrets）から、Node は `process.env` から |
+| 撤去 | `vercel.json`、`api/`、`@vercel/*`、Express / multer / compression、Blob 登録 API |
 
-### 環境変数
+### バインディング・環境変数・シークレット
 
-| 変数 | 必須 | 設定元 |
+| 名前 | 種別 | 用途 |
 | --- | --- | --- |
-| `DATABASE_URL` | 必須 | Neon 連携で自動（pooled 接続文字列） |
-| `BLOB_READ_WRITE_TOKEN` | 必須 | Blob ストア接続で自動 |
-| `CRON_SECRET` | 必須 | 手動（ランダム文字列） |
-| `PUBLIC_ORIGIN` | 推奨 | 手動（独自ドメイン）。未設定時は `X-Forwarded-Host` から組み立てる |
-| `SERVICE_NAME` / `SUPPORT_EMAIL` / `ACCOUNT_QUOTA_BYTES` / `AUTO_MIGRATE` | 任意 | 手動 |
-| `VERCEL` | 自動 | Vercel が付与（`isVercel` の判定に使用） |
+| `ASSETS` | Static Assets バインディング | `web/dist` の配信 |
+| `ASSETS_BUCKET` | R2 バインディング（`nocode-ar-assets` / preview `nocode-ar-assets-preview`） | 素材 |
+| `DATABASE_URL` | シークレット（`wrangler secret put`） | Neon の pooled 接続文字列 |
+| `CRON_SECRET` | シークレット（任意） | HTTP の掃除エンドポイント保護 |
+| `PUBLIC_ORIGIN` | var（`[vars]`） | QR に埋め込む公開 URL のオリジン（独自ドメイン） |
+| `SERVICE_NAME` / `SUPPORT_EMAIL` / `ACCOUNT_QUOTA_BYTES` | var | 表示名 / サポート連絡先 / アカウント容量上限 |
+
+### 設定手順（オーナー）
+
+README「Cloudflare へのデプロイ」のとおり: `wrangler login` → R2 バケット作成 → Neon 作成（pooled 接続文字列）→ `wrangler secret put DATABASE_URL`（任意で `CRON_SECRET`）→ `DATABASE_URL=... npm run migrate` → `npm run worker:deploy` → `/healthz` が `db: neon, storage: r2` → 独自ドメインと `PUBLIC_ORIGIN`。
 
 ### コスト上の注意
 
-- **Blob の帯域**: 閲覧者は素材（動画 50 MB まで）を Blob から直接取得するため、体験回数 × 素材サイズがそのまま Blob の転送量になる。動画は 1080p / 30 秒以内を推奨（R7 の注意表示）。Blob のキャッシュ（既定 `cacheControlMaxAge` 1 か月）は効くが、初回取得は課金対象。
-- **Function の実行時間**: 1 リクエストは数十 ms〜数百 ms。`/assets/register` は Blob への HEAD + Range GET を含むため 1 秒前後。Cron の掃除は素材数に比例（`maxDuration` 30 秒以内に収まる想定。超える規模になったらページングを入れる）。
-- **Neon**: 接続は Pool 最大 5 / 関数インスタンス。Fluid compute で再利用される。Neon の無料枠はコンピュート時間に上限があるため、計測イベントの書き込み頻度が高い場合は有料プランを検討。
-- **Hobby プランの制約**: Cron は 1 日 1 回まで（既定の `0 3 * * *`）。関数の `maxDuration` 上限など。Pro で毎時に変更可。
+- **Workers**: Free は 10 万リクエスト/日・CPU 10 ms/リクエスト。素材配信も Worker を通るため、体験 1 回あたり十数リクエスト（HTML / JS / JSON / 素材 3〜4 件）。CPU 時間は R2 のストリーム中継が中心で小さいが、`.mind` の gzip（アップロード時）と scrypt（ログイン時）は数十 ms かかるため Paid（50 ms〜）が安全。
+- **R2**: ストレージ 10 GB・Class A 100 万 / Class B 1,000 万 操作/月が無料枠。**下り転送は無料**（動画の配信量が増えても帯域課金なし）。
+- **Neon**: Free はコンピュート時間に上限。計測イベント（`page_open` 等）は 1 体験あたり 3〜4 回の INSERT。Neon HTTP は接続プール不要で Workers と相性が良い。
+- **Cron**: 15 分ごとの掃除は 1 日 96 回（Free の制限内）。
 
 ### 本環境で確認できたこと / できなかったこと
 
-- 確認済み: `npx vercel build`（ダミーの `.vercel/project.json`）で `.vercel/output` に `functions/api/index.func` と `static/` が生成され、ルーティング（`config.json`）が期待どおり。コンパイル済み関数を Node で直接呼び出し、PGlite + ローカル素材で `/healthz` `/api/config` `/api/auth/signup` が動作。
-- 未確認（実デプロイが必要）: Neon への接続、Blob の実アップロード（`handleUpload` のトークン発行とクライアント PUT）、Range GET の挙動、Cron の実行、CDN 圧縮の実測。
+- 確認済み: Node モード（PGlite + ローカルファイル）で Vitest 56 件と E2E 24 ステップが全パス。`wrangler deploy --dry-run` でバンドル生成（worker.js 1.19 MB、gzip 222 KB。Free の上限 3 MB gzip 以内）。`wrangler dev`（Miniflare、R2 と Static Assets のエミュレーション）で `/healthz`、静的配信、`/v/` の書き換え、SPA フォールバック、`/api/config`、API の 404 を確認。Neon アダプタのトランザクション組み立てと R2 アダプタ（フェイクバケット）は単体テスト。
+- 未確認（実デプロイ・外部サービスが必要）: Neon への実接続と HTTP トランザクション、R2 への実アップロード（`FixedLengthStream` でのストリーミング）と Range 配信、Cron Trigger の実行、エッジ圧縮の実測、Workers の CPU 時間（scrypt / gzip）。
