@@ -104,6 +104,13 @@ export const KIND_MAX_BYTES: Record<AssetKind, number> = {
   target_mind: LIMITS.mindBytes,
 }
 
+/** R5-M-02: 種類に応じた上限超過の文言（FR-3-2 / FR-4-2 の文言と整合） */
+export function sizeLimitError(kind: AssetKind): AssetError {
+  if (kind === 'target_image' || kind === 'thumbnail') return new AssetError(413, '10 MB 以下の画像にしてください', 'too_large')
+  if (kind === 'target_mind') return new AssetError(413, 'ターゲットデータが大きすぎます（20 MB まで）', 'too_large')
+  return new AssetError(413, 'ファイルが大きすぎます（動画 50 MB / 3D 20 MB / 画像 10 MB）', 'too_large')
+}
+
 export interface Validated {
   mime: string
   ext: string
@@ -205,7 +212,7 @@ const HEAD_BYTES = 64 * 1024
  */
 export async function saveAsset(db: Db, storage: Storage, input: SaveAssetInput): Promise<AssetRow> {
   const { projectId, kind, body, size } = input
-  if (size > KIND_MAX_BYTES[kind]) throw new AssetError(413, 'ファイルが大きすぎます（動画 50 MB / 3D 20 MB / 画像 10 MB）', 'too_large')
+  if (size > KIND_MAX_BYTES[kind]) throw sizeLimitError(kind)
   await checkQuotas(db, projectId, input.userId, input.accountQuotaBytes, size)
   const id = newId()
   const key = `projects/${projectId}/${kind}/${id}`
@@ -224,6 +231,8 @@ export async function saveAsset(db: Db, storage: Storage, input: SaveAssetInput)
     try {
       const stat = await storage.stat(key)
       if (!stat) throw new AssetError(400, '素材を保存できませんでした')
+      // R5-M-01: 申告サイズ（Content-Length）と実サイズの不一致は拒否し、切り詰め / 超過ファイルを残さない
+      if (stat.size !== size) throw new AssetError(400, '送信されたデータのサイズが申告と一致しません。もう一度お試しください', 'size_mismatch')
       const head = await readHead(storage, key, Math.min(HEAD_BYTES, Math.max(stat.size, 1)))
       v = validateAsset(kind, head, stat.size, input)
       await checkQuotas(db, projectId, input.userId, input.accountQuotaBytes, stat.size)

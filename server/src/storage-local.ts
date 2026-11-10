@@ -52,5 +52,26 @@ export function createLocalStorage(dataDir: string): Storage {
         /* ignore */
       }
     },
+    /** assets/projects/<pid>/<kind>/<id> を走査（迷子ファイルの掃除用。R5-M-01） */
+    async list(prefix) {
+      const base = path.join(root, 'projects')
+      if (!fs.existsSync(base)) return []
+      const out: { key: string; size: number; contentType: null; uploadedAt: Date }[] = []
+      for (const pid of fs.readdirSync(base)) {
+        const pdir = path.join(base, pid)
+        if (!fs.statSync(pdir).isDirectory()) continue
+        for (const kind of fs.readdirSync(pdir)) {
+          const kdir = path.join(pdir, kind)
+          if (!fs.statSync(kdir).isDirectory()) continue
+          for (const id of fs.readdirSync(kdir)) {
+            const key = `projects/${pid}/${kind}/${id}`
+            if (!key.startsWith(prefix) || !isValidKey(key)) continue
+            const st = fs.statSync(path.join(kdir, id))
+            if (st.isFile()) out.push({ key, size: st.size, contentType: null, uploadedAt: st.mtime })
+          }
+        }
+      }
+      return out
+    },
   }
 }

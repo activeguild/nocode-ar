@@ -143,13 +143,29 @@ export const requireAuth: MiddlewareHandler<{ Variables: AppVariables }> = async
   await next()
 }
 
+const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1', 'localhost'])
+
+/** 接続元がループバックか（@hono/node-server では c.env.incoming にソケットがある。Workers では判定不能 → false） */
+export function isLoopbackPeer(c: Context): boolean {
+  const incoming = (c.env as { incoming?: { socket?: { remoteAddress?: string } } } | undefined)?.incoming
+  const addr = incoming?.socket?.remoteAddress
+  return !!addr && LOOPBACK.has(addr)
+}
+
+/** D-22: このリクエストで X-Forwarded-* を信頼してよいか */
+export function trustForwarded(c: Context, trustProxy: boolean | 'loopback'): boolean {
+  if (trustProxy === true) return true
+  if (trustProxy === 'loopback') return isLoopbackPeer(c)
+  return false
+}
+
 /** 状態変更リクエストの Origin 検査（NFR-9） */
-export function checkOrigin(trustProxy: boolean): MiddlewareHandler {
+export function checkOrigin(trustProxy: boolean | 'loopback'): MiddlewareHandler {
   return async (c, next) => {
     if (['GET', 'HEAD', 'OPTIONS'].includes(c.req.method)) return next()
     const origin = c.req.header('origin')
     if (!origin) return next() // ブラウザ以外（テスト・curl）
-    const hosts = [c.req.header('host'), trustProxy ? c.req.header('x-forwarded-host') : undefined].filter(Boolean).map((h) => String(h).split(',')[0].trim())
+    const hosts = [c.req.header('host'), trustForwarded(c, trustProxy) ? c.req.header('x-forwarded-host') : undefined].filter(Boolean).map((h) => String(h).split(',')[0].trim())
     try {
       if (hosts.includes(new URL(origin).host)) return next()
     } catch {

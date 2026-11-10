@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { emptyScene, isAllowedButtonUrl, judgeTargetQuality, publishBlockers, sceneSchema, toDayJst } from '../../shared/src/index.js'
-import { detectFileType, imageDimensions, looksLikeMind, validateAsset } from '../src/assets.js'
+import { detectFileType, imageDimensions, looksLikeMind, sizeLimitError, validateAsset } from '../src/assets.js'
 import { hashPassword, verifyPassword } from '../src/auth.js'
 import { newSlug, newToken } from '../src/ids.js'
 import { configFromEnv } from '../src/config.js'
@@ -80,9 +80,16 @@ describe('設定（configFromEnv）', () => {
     const c = configFromEnv({ DATABASE_URL: 'postgres://x', CRON_SECRET: 's' }, { runtime: 'worker' })
     expect(c).toMatchObject({ cookieSecure: true, compressResponses: false, trustProxy: false, autoMigrate: false, databaseUrl: 'postgres://x' })
   })
-  it('Node ローカルでは PGlite 自動マイグレーション、圧縮あり', () => {
+  it('Node ローカルでは PGlite 自動マイグレーション、圧縮あり、TRUST_PROXY 既定は loopback（D-22 / R5-M-04）', () => {
     const c = configFromEnv({}, { runtime: 'node' })
-    expect(c).toMatchObject({ cookieSecure: false, compressResponses: true, trustProxy: true, autoMigrate: true, databaseUrl: null })
+    expect(c).toMatchObject({ cookieSecure: false, compressResponses: true, trustProxy: 'loopback', autoMigrate: true, databaseUrl: null })
     expect(configFromEnv({ TRUST_PROXY: 'false' }, { runtime: 'node' }).trustProxy).toBe(false)
+    expect(configFromEnv({ TRUST_PROXY: 'true' }, { runtime: 'node' }).trustProxy).toBe(true)
+    expect(configFromEnv({ TRUST_PROXY: 'loopback' }, { runtime: 'node' }).trustProxy).toBe('loopback')
+  })
+  it('R5-M-02: 上限超過の文言は種類ごと', () => {
+    expect(sizeLimitError('target_image').message).toBe('10 MB 以下の画像にしてください')
+    expect(sizeLimitError('target_mind').message).toContain('20 MB')
+    expect(sizeLimitError('overlay').message).toContain('動画 50 MB')
   })
 })

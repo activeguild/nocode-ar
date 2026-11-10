@@ -62,7 +62,7 @@ PC とスマホを同じ Wi-Fi に接続し、作成画面の「スマホで確�
 
 ## Cloudflare へのデプロイ（本番）
 
-前提: Cloudflare アカウント（Workers Free でも可）、Neon アカウント、Node 22。`wrangler` は devDependency に含まれる（`npx wrangler`）。以下はオーナーが 1 回だけ行う。
+前提: Cloudflare アカウント、Neon アカウント、Node 22。Workers は Free でも動くが、**ログイン時の scrypt と `.mind` アップロード時の gzip は 1 リクエストで数十 ms の CPU 時間を使い、Free の上限（10 ms/リクエスト）を超えて失敗し得る**ため、本番は **Workers Paid（CPU 30 秒まで）を推奨**（`docs/04_architecture.md`「コスト上の注意」）。`wrangler` は devDependency に含まれる（`npx wrangler`）。以下はオーナーが 1 回だけ行う。
 
 1. **ログイン**: `npx wrangler login`
 2. **R2 バケット作成**: `npx wrangler r2 bucket create nocode-ar-assets`（`wrangler.toml` の `bucket_name` と一致させる。プレビュー用に `nocode-ar-assets-preview` も作る）。R2 の有効化にはダッシュボードで R2 の利用開始（支払い方法の登録）が必要
@@ -121,7 +121,7 @@ npm start          # http://localhost:3000 で API とビルド済みフロン�
 | `SUPPORT_EMAIL` | （なし） | ログイン画面に出すパスワード再設定の連絡先 |
 | `SERVICE_NAME` | ARチラシ（仮） | サービス名 |
 | `NODE_ENV=production` または `COOKIE_SECURE=1` | | セッション Cookie に `Secure` を付ける（HTTPS 配信時に設定） |
-| `TRUST_PROXY` | `true` | Node 常駐時に `X-Forwarded-Host/Proto` を信頼するか（Vite 開発サーバやリバースプロキシ配下）。`false` で無効 |
+| `TRUST_PROXY` | `loopback` | Node 常駐時に `X-Forwarded-Host/Proto` を信頼する範囲（D-22）。`loopback` = 同一ホスト（127.0.0.1 / ::1）のプロキシ（Vite 開発サーバ等）のみ、`true` = 常に（別ホストの LB 配下）、`false` = 信頼しない（Node を直接公開する場合） |
 | `ACCOUNT_QUOTA_BYTES` | 2147483648（2 GB） | 1 アカウントの素材合計上限（NFR-4） |
 
 常駐時は Hono の `compress`（gzip / brotli）が JS / CSS / JSON / HTML を圧縮します。ターゲットデータ `.mind` は保存時に gzip 済みです。Cloudflare 上では CDN が圧縮するため Worker 側の圧縮は無効です。

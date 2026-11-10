@@ -7,8 +7,11 @@ export interface Config {
   supportEmail: string | null
   serviceName: string
   cookieSecure: boolean
-  /** X-Forwarded-Host / Proto を信頼するか（Node 常駐で同一ホストのプロキシ配下のとき true。Workers では不要） */
-  trustProxy: boolean
+  /**
+   * X-Forwarded-Host / Proto を信頼する範囲（D-22）。
+   * 'loopback' = 同一ホスト（127.0.0.1 / ::1）からのプロキシのみ信頼（Node の既定）、true = 常に、false = 信頼しない（Workers）
+   */
+  trustProxy: boolean | 'loopback'
   /** 1 アカウントの素材合計上限（D-06 / NFR-4）。既定 2 GB */
   accountQuotaBytes: number
   /** Cron エンドポイント（任意公開）の Bearer 秘密。未設定なら 503 */
@@ -32,7 +35,7 @@ export function configFromEnv(env: EnvLike, opts: { runtime: 'node' | 'worker' }
     supportEmail: env.SUPPORT_EMAIL || null,
     serviceName: env.SERVICE_NAME || 'ARチラシ（仮）',
     cookieSecure: isWorker || env.COOKIE_SECURE === '1' || env.NODE_ENV === 'production',
-    trustProxy: isWorker ? false : env.TRUST_PROXY === undefined ? true : env.TRUST_PROXY !== 'false' && env.TRUST_PROXY !== '0',
+    trustProxy: isWorker ? false : env.TRUST_PROXY === undefined || env.TRUST_PROXY === 'loopback' ? 'loopback' : env.TRUST_PROXY === 'true' || env.TRUST_PROXY === '1',
     accountQuotaBytes: Number(env.ACCOUNT_QUOTA_BYTES ?? 2 * 1024 * 1024 * 1024),
     cronSecret: env.CRON_SECRET || null,
     compressResponses: !isWorker,

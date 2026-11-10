@@ -27,7 +27,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     supportEmail: null,
     serviceName: 'テスト',
     cookieSecure: false,
-    trustProxy: true,
+    trustProxy: 'loopback',
     accountQuotaBytes: 2 * 1024 * 1024 * 1024,
     cronSecret: 'test-cron-secret',
     compressResponses: true,

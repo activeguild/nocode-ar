@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import http from 'node:http'
 import path from 'node:path'
 import request from 'supertest'
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -632,5 +633,106 @@ describe('Cloudflare 構成（生ボディのアップロード、鍵はサー�
     const partial = await request(t.app).get('/api/cron/cleanup').set('Authorization', 'Bearer test-cron-secre')
     expect(partial.status).toBe(401)
     expect(partial.body.error).toBe('認証に失敗しました')
+  })
+})
+
+describe('QA ラウンド 5 の修正（R5-M-01〜05）', () => {
+  it('R5-M-01: 申告サイズと実サイズが違う生ボディは拒否され、切り詰めファイルが残らない', async () => {
+    const { saveAsset } = await import('../src/assets.js')
+    const cookie = await signup()
+    const p = await createProject(cookie)
+    const png = Buffer.concat([tinyPng(), Buffer.alloc(50_000, 1)])
+    // ストリームとして 100 バイトと申告（Content-Length 偽装相当）
+    const stream = new Blob([new Uint8Array(png.buffer, png.byteOffset, png.byteLength)]).stream() as ReadableStream<Uint8Array>
+    const userId = (await t.db.query<{ id: string }>('SELECT id FROM users')).rows[0].id
+    await expect(saveAsset(t.db, t.storage, { projectId: p.id, userId, accountQuotaBytes: 1e9, kind: 'overlay', body: stream, size: 100 })).rejects.toMatchObject({ status: 400, code: 'size_mismatch' })
+    const dir = path.join(t.dataDir, 'assets', 'projects', p.id, 'overlay')
+    expect(fs.existsSync(dir) ? fs.readdirSync(dir) : []).toEqual([])
+    expect(await count('SELECT COUNT(*) AS n FROM assets WHERE project_id = $1', [p.id])).toBe(0)
+  })
+
+  it('R5-M-01: ローカルストレージも迷子ファイルを一覧でき、掃除で削除される', async () => {
+    const cookie = await signup()
+    const p = await createProject(cookie)
+    const ok = await upload(cookie, p.id, 'overlay', tinyPng())
+    expect(ok.status).toBe(201)
+    const orphanKey = `projects/${p.id}/overlay/orphanOrphanOrphan1234`
+    await t.storage.put(orphanKey, Buffer.from('junk'), 'application/octet-stream')
+    const listed = await t.storage.list!(`projects/${p.id}/`)
+    expect(listed.map((o) => o.key).sort()).toEqual([`projects/${p.id}/overlay/${ok.body.asset.id}`, orphanKey].sort())
+    const cron = () => request(t.app).get('/api/cron/cleanup').set('Authorization', 'Bearer test-cron-secret')
+    expect((await cron()).body.orphanBlobsDeleted).toBe(0) // 猶予内
+    const old = new Date(Date.now() - 3600_000)
+    fs.utimesSync(path.join(t.dataDir, 'assets', orphanKey), old, old)
+    expect((await cron()).body.orphanBlobsDeleted).toBe(1)
+    expect(await t.storage.stat(orphanKey)).toBeNull()
+    expect(await t.storage.stat(`projects/${p.id}/overlay/${ok.body.asset.id}`)).not.toBeNull()
+  })
+
+  it('R5-M-02: 10 MB 超のターゲット画像は FR-3-2 の文言で 413', async () => {
+    const cookie = await signup()
+    const p = await createProject(cookie)
+    const res = await request(t.app).post(`/api/projects/${p.id}/assets?kind=target_image`).set('Cookie', cookie).set('Content-Type', 'image/png').set('Content-Length', String(11 * 1024 * 1024)).send(Buffer.alloc(0))
+    expect(res.status).toBe(413)
+    expect(res.body.error).toBe('10 MB 以下の画像にしてください')
+    const big = await upload(cookie, p.id, 'target_image', Buffer.concat([tinyPng(), Buffer.alloc(10 * 1024 * 1024 + 1)]))
+    expect(big.status).toBe(413)
+    expect(big.body.error).toBe('10 MB 以下の画像にしてください')
+    const mind = await request(t.app).post(`/api/projects/${p.id}/assets?kind=target_mind`).set('Cookie', cookie).set('Content-Type', 'application/octet-stream').set('Content-Length', String(21 * 1024 * 1024)).send(Buffer.alloc(0))
+    expect(mind.body.error).toContain('20 MB')
+  })
+
+  it('R5-M-04: X-Forwarded-Host はループバックからのみ信頼（既定 loopback）、false なら無視', async () => {
+    const cookie = await signup()
+    const p = await createProject(cookie)
+    // supertest はループバックから接続する → 信頼される
+    const viaProxy = await request(t.app).get(`/api/projects/${p.id}`).set('Cookie', cookie).set('X-Forwarded-Host', 'ar.example.net').set('X-Forwarded-Proto', 'https')
+    expect(viaProxy.body.publicUrl).toBe(`https://ar.example.test/v/${p.slug}`) // publicOrigin 設定が最優先
+    t.cleanup()
+    t = await makeTestApp({ publicOrigin: null })
+    const cookie2 = await signup()
+    const p2 = await createProject(cookie2)
+    const fwd = await request(t.app).get(`/api/projects/${p2.id}`).set('Cookie', cookie2).set('X-Forwarded-Host', 'ar.example.net').set('X-Forwarded-Proto', 'https')
+    expect(fwd.body.publicUrl).toBe(`https://ar.example.net/v/${p2.slug}`)
+    t.cleanup()
+    t = await makeTestApp({ publicOrigin: null, trustProxy: false })
+    const cookie3 = await signup()
+    const p3 = await createProject(cookie3)
+    const ignored = await request(t.app).get(`/api/projects/${p3.id}`).set('Cookie', cookie3).set('X-Forwarded-Host', 'ar.example.net')
+    expect(ignored.body.publicUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/v\//)
+    // Origin 検査も同様（false のとき X-Forwarded-Host 一致では通らない）
+    const csrf = await request(t.app).post('/api/projects').set('Cookie', cookie3).set('Origin', 'https://ar.example.net').set('X-Forwarded-Host', 'ar.example.net').send({ name: 'x' })
+    expect(csrf.status).toBe(403)
+  })
+
+  it('R5-M-05: chunked（Content-Length なし）の 2 MB JSON も実バイト数で 413', async () => {
+    const cookie = await signup()
+    const server = http.createServer(t.app)
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    const port = (server.address() as { port: number }).port
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/api/projects', headers: { 'Content-Type': 'application/json', Cookie: cookie, 'Transfer-Encoding': 'chunked' } }, (res) => {
+          res.resume()
+          res.on('end', () => resolve(res.statusCode ?? 0))
+        })
+        req.on('error', (e: NodeJS.ErrnoException) => (e.code === 'EPIPE' || e.code === 'ECONNRESET' ? resolve(413) : reject(e)))
+        req.write('{"name":"')
+        const chunk = 'x'.repeat(64 * 1024)
+        let written = 0
+        const pump = () => {
+          while (written < 2 * 1024 * 1024) {
+            written += chunk.length
+            if (!req.write(chunk)) return req.once('drain', pump)
+          }
+          req.end('"}')
+        }
+        pump()
+      })
+      expect(status).toBe(413)
+      expect(await count('SELECT COUNT(*) AS n FROM projects', [])).toBe(0)
+    } finally {
+      server.close()
+    }
   })
 })

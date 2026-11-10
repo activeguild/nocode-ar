@@ -6,7 +6,7 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import QRCode from 'qrcode'
 import { z } from 'zod'
 import { ASSET_KINDS, analyticsEventSchema, publishBlockers, sceneSchema, toDayJst, type AssetKind } from '../../shared/src/index.js'
-import { AssetError, KIND_MAX_BYTES, deleteAsset, getAsset, saveAsset, toAssetInfo } from './assets.js'
+import { AssetError, KIND_MAX_BYTES, deleteAsset, getAsset, saveAsset, sizeLimitError, toAssetInfo } from './assets.js'
 import {
   attachUser,
   checkOrigin,
@@ -20,6 +20,7 @@ import {
   requireAuth,
   safeEqual,
   sessionCookie,
+  trustForwarded,
   verifyPassword,
   type AppContext,
   type AppVariables,
@@ -75,7 +76,7 @@ export class HttpError extends Error {
 function publicOrigin(c: AppContext, config: Config): string {
   if (config.publicOrigin) return config.publicOrigin
   const url = new URL(c.req.url)
-  if (config.trustProxy) {
+  if (trustForwarded(c, config.trustProxy)) {
     const proto = c.req.header('x-forwarded-proto')?.split(',')[0]
     const host = c.req.header('x-forwarded-host')?.split(',')[0]
     if (host) return `${proto || url.protocol.replace(':', '')}://${host}`
@@ -117,6 +118,25 @@ export function parseRange(header: string | undefined, size: number): { start: n
   return { start, end }
 }
 
+/** ReadableStream を上限付きで読む。超えたら 413 */
+export async function readBodyLimited(body: ReadableStream<Uint8Array> | null, limit: number): Promise<string> {
+  if (!body) return ''
+  const reader = body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.byteLength
+    if (total > limit) {
+      await reader.cancel().catch(() => {})
+      throw new HttpError(413, '送信データが大きすぎます（1 MB まで）')
+    }
+    chunks.push(value)
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks.map((c) => Buffer.from(c))))
+}
+
 export function createApp({ db, storage, config }: AppDeps) {
   const app = new Hono<{ Variables: AppVariables }>()
 
@@ -131,9 +151,11 @@ export function createApp({ db, storage, config }: AppDeps) {
     await next()
   })
 
+  /** JSON 本文を実バイト数で上限チェックしながら読む（R5-M-05: chunked でも 1 MB を超えたら 413） */
   const json = async <T>(c: AppContext): Promise<T> => {
+    const text = await readBodyLimited(c.req.raw.body, JSON_BODY_LIMIT)
     try {
-      return (await c.req.json()) as T
+      return JSON.parse(text) as T
     } catch {
       throw new HttpError(400, 'JSON の形式が不正です')
     }
@@ -271,7 +293,7 @@ export function createApp({ db, storage, config }: AppDeps) {
       if (!Number.isFinite(size) || size <= 0) throw new HttpError(400, 'Content-Length が必要です')
       if (!c.req.raw.body) throw new HttpError(400, 'ファイルがありません')
       if (!ASSET_KINDS.includes(kind as AssetKind)) throw new HttpError(400, 'kind が不正です')
-      if (size > KIND_MAX_BYTES[kind as AssetKind]) throw new AssetError(413, 'ファイルが大きすぎます（動画 50 MB / 3D 20 MB / 画像 10 MB）', 'too_large')
+      if (size > KIND_MAX_BYTES[kind as AssetKind]) throw sizeLimitError(kind as AssetKind)
       // ターゲットデータは gzip して保存するため本体をメモリに載せる（上限 20 MB）。それ以外はストレージへ流す
       body = kind === 'target_mind' ? Buffer.from(await c.req.arrayBuffer()) : (c.req.raw.body as ReadableStream<Uint8Array>)
       if (Buffer.isBuffer(body)) size = body.length
@@ -279,7 +301,7 @@ export function createApp({ db, storage, config }: AppDeps) {
       meta = { width: c.req.query('width'), height: c.req.query('height'), durationSec: c.req.query('durationSec') }
     }
     if (!ASSET_KINDS.includes(kind as AssetKind)) throw new HttpError(400, 'kind が不正です')
-    if (size > KIND_MAX_BYTES[kind as AssetKind]) throw new AssetError(413, 'ファイルが大きすぎます（動画 50 MB / 3D 20 MB / 画像 10 MB）', 'too_large')
+    if (size > KIND_MAX_BYTES[kind as AssetKind]) throw sizeLimitError(kind as AssetKind)
     const a = await saveAsset(db, storage, {
       projectId: p.id,
       userId: user(c).id,

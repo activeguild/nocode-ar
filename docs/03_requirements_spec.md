@@ -513,3 +513,13 @@ Major D-01〜D-05 はすべて修正。Minor は D-10 / D-13 / D-19 / D-20 を�
 | 掃除 | Vercel Cron（日次）→ Cron Triggers **15 分ごと** | Q4 の「猶予後、次の掃除で」が最大 30 分以内に |
 | 運用 | `wrangler secret put DATABASE_URL`、`npm run migrate`（Node から Neon へ）、`npm run worker:deploy`。`.dev.vars.example` / `.env.example` はキー名のみ | NFR-11 |
 | 撤去 | `vercel.json`、`api/`、`@vercel/*`、Express / multer / compression | — |
+
+### 14.1 QA ラウンド 5（R5-M-01〜05）への対応
+
+| # | 対応 |
+| --- | --- |
+| R5-M-01 | ストリーム保存後に実サイズと申告（Content-Length）の不一致を検出して削除・400（`size_mismatch`）。ローカルストレージにも `list` を実装し、DB に無いファイルは掃除（15 分猶予）で削除 |
+| R5-M-02 | 上限超過の文言を種類ごとに（画像「10 MB 以下の画像にしてください」/ ターゲットデータ「20 MB まで」/ オーバーレイ「動画 50 MB / 3D 20 MB / 画像 10 MB」） |
+| R5-M-03 | README の前提に Workers の CPU 時間（scrypt / `.mind` gzip）と Paid 推奨を追記 |
+| R5-M-04 | Node 常駐時の `TRUST_PROXY` 既定を `loopback`（接続元がループバックのときだけ `X-Forwarded-*` を信頼）に戻し、`true` / `false` も選べる。Workers は常に信頼しない。テストで既定値と挙動を固定 |
+| R5-M-05 | JSON 本文は `Content-Length` に依存せず、ストリームを読みながら実バイト数で 1 MB を超えた時点で 413 |
