@@ -500,3 +500,88 @@ Minor の修正確認（デグレなし）: D-07（PATCH 400 は「入力内容�
 | 10 | 下書きで素材を差し替えて 15 分以上放置 → Cron 実行 | 旧素材が Blob から消え、公開版・下書きが参照する素材は残る |
 | 11 | 2 アカウントで B-R3-01 の再現手順（他ユーザーの Blob URL / pathname を `register` に渡す） | すべて 400 で、被害者の Blob が残る |
 | 12 | `vercel logs` | `level: error` なし。コールドスタート時の DB 接続エラーなし |
+
+---
+
+# ラウンド 5（Cloudflare + Neon 構成への載せ替えのデグレ確認と新構成の検証）
+
+- 実施日: 2026-11-10
+- 対象: コミット `d1b590f`（Move to Cloudflare: Hono app, Workers entry with Static Assets and Cron, Neon HTTP driver, R2 storage with streaming upload and Range delivery; remove Vercel）。要件定義 §14、`docs/04_architecture.md`「Cloudflare 構成」、README「Cloudflare へのデプロイ」
+- 判定: **条件付き合格**。Blocker 0 件、Major 0 件。Node モード（Hono + PGlite + ローカル素材）で機能・セキュリティともにデグレなし。B-R3-01 の経路（クライアントが鍵 / URL を申告する API）は廃止され、新しいアップロード API の異常系は多層で拒否される。条件は、Workers / Neon / R2 / Cron の実挙動と実機を本番 URL で確認すること（§R5-6）。Minor 5 件は §R5-5。
+
+## R5-1. 自動テスト（再実行）
+
+| コマンド | 結果 |
+| --- | --- |
+| `npm run typecheck` | 成功 |
+| `npm test` | Vitest 56 件 すべて成功（R2 アダプタのフェイクバケット、Neon トランザクション組み立て、Range 解析、生ボディアップロードのテストを含む） |
+| `npm run e2e` | 24 ステップ すべて成功、コンソールエラー 0 件（Node モード。閲覧ページの認識ステップが通っているため、gzip 配信の `.mind` がブラウザで透過展開されることも確認） |
+| `npm audit` | 0 件 |
+| QA `api-tests.mjs`（Node モード、保存鍵の変更に追従） | 112 項目中 PASS 100 / SKIP 11（DB 直接確認 → `r5-checks.mts`）/ FAIL 1（TC-M1-05a: 文言のみ。§R5-5 R5-M-02） |
+| QA `ui-tests-2.mjs` | 18 項目中 PASS 16 / FAIL 2（D-20 と、slug「zkpllpql」を英語と誤検出した検証側要因） |
+| QA `r5-checks.mts` / `r5-mem.mts`（PGlite インメモリ + ローカル / メモリストレージ） | 33 項目中 PASS 31 / FAIL 2（TC-R5-UP-1 は 400 で正しく拒否されており文言取得のみ失敗、TC-R5-UP-RESIDUE は R5-M-01） |
+| サーバログ | `level: error` 0 行 |
+
+## R5-2. デグレ確認（Node モード）
+
+| 区分 | 確認内容 | 結果 |
+| --- | --- | --- |
+| TC-S 全件 | 未認証 401（17 エンドポイント）、他ユーザー 404、アップロード偽装（拡張子 / MIME / 0 バイト / SVG / GIF ポリグロット / kind 不正 / MP4 以外の ISO-BMFF）、パストラバーサル（保存鍵 `projects/<pid>/<kind>/<id>` はサーバ生成、`/a/../`、`%2e%2e`、他人 assetId の DELETE・参照）、秘密情報なし、Cookie 属性・無効化・ID 更新、CSRF `Origin` 検査、scrypt、XSS・CSV 無害化、エラー応答（1 MB 超 413、スタック漏えいなし、`X-Powered-By` なし）、`npm audit` 0 | ○ |
+| D-01 素材露出 | 公開 API の `assets` は公開版が参照する 3 件のみ。下書き専用・未参照の素材 ID を含まない。他ユーザーの素材を下書きで参照 → 400 | ○ |
+| ロック / レート制限（DB 保持） | `login_locks` で 10 回失敗 → 429、60 秒後に 1 回照合（D-21）。`rate_limits` で 61 回目以降 429、不明 slug は 404 | ○ |
+| 容量 | 50 MiB × 2 → 201、次の素材で 413 `quota`（早期拒否）。アカウント合計上限の実装維持 | ○ |
+| Cron | HTTP: Bearer なし / 誤り 401「認証に失敗しました」（定数時間比較）、正しい secret 200。15 分超の未参照素材をファイルごと削除、参照中は残す。メモリ（R2 相当）では DB に無い迷子オブジェクトも削除 | ○ |
+| 廃止 API | `/assets/register`, `/blob-upload` → 404 | ○ |
+| UI（ui-tests-2） | 認識（PNG）、差し替え、R7、解析中の離脱 / 2 秒以内の遷移、カメラ拒否、axe、削除ダイアログ、スマホ幅、ログアウト | ○（D-20 のみ従来どおり） |
+| DB 依存ケース | 期限切れセッション 401、`analytics_events` に IP / UA 列なし、JST 境界、10 世代、停止中 slug の `page_open` 204 / `cta_tap` 400 | ○ |
+
+## R5-3. 新構成固有の確認
+
+| # | 確認項目 | 結果 |
+| --- | --- | --- |
+| (a) `npx wrangler deploy --dry-run --outdir <scratchpad>/dist-worker` | 成功。Total Upload 1,185 KiB / gzip 222 KiB（Free の 3 MB 以内）。バインディング: `env.ASSETS_BUCKET`（R2 `nocode-ar-assets`）、`env.ASSETS`（Assets）、`env.SERVICE_NAME`。`wrangler.toml`: `compatibility_date = 2026-11-01`、`compatibility_flags = [nodejs_compat]`、`[assets] directory = ./web/dist, binding = ASSETS, run_worker_first = true, not_found_handling = none, html_handling = none`、`[[r2_buckets]]`（本番 / preview バケット）、`[triggers] crons = ["*/15 * * * *"]`、`[observability]`、`[vars]` は公開値のみ（`PUBLIC_ORIGIN` 等はコメントで案内）。秘密情報は `wrangler secret put` | ○ |
+| (b) `npx wrangler dev --test-scheduled`（Miniflare。`--var DATABASE_URL:<ダミー>`、`.dev.vars` は作らず） | `/healthz` 200 `{db:"neon",storage:"r2"}`。`/` → index.html（`no-cache`、`nosniff`）、`/projects/x` → index.html（SPA）、`/v/abcd1234` → viewer.html（`no-cache`、`nosniff`）、`/legal.html` → 200 直接配信（307 なし）、`/assets/viewer-*.js` → `immutable` + `nosniff` + `text/javascript`、`/nothing.txt`（非 HTML）→ 404、`/api/nothing` → 404 JSON「ページが見つかりません」、`/api/config` 200、`/api/cron/cleanup` Bearer なし / 誤り → 401。`/__scheduled?cron=*/15+*+*+*+*` → 200「Ran scheduled event」で `scheduled()` が `runCleanup` を実行（ダミー DB のため接続エラーがログに出る = 経路は動作）。`/a/<不明>` はダミー DB のため 500（DB 照会が先。実 DB では 404。Node モードで 404 を確認） | ○ |
+| (c) アップロードの異常系（生ボディ / multipart） | `Content-Length` なし（chunked）→ 400「Content-Length が必要です」、`Content-Length` 0 → 400、60 MB 申告 → 413（本体を受け取る前に拒否）、`Content-Type: image/png` を偽った GLB をターゲットに → 400（マジックバイト）、テキスト → 400、kind 不一致（thumbnail に MP4）→ 400、kind 不正 → 400、他ユーザーのプロジェクト ID → 404、10 MB 超の画像（ストリーム保存後に検証）→ 413 で削除、`target_mind` に PNG → 400。メモリ（R2 相当）でも不正本体は保存後に削除され残らない。**例外**: `Content-Length` を実際より小さく偽装（100 と申告して 52 KB 送信）→ 400 だが、ローカルストレージに 100 バイトの切り詰められたファイル（DB 行なし）が残る（§R5-5 R5-M-01） | ◎ |
+| (d) `/a/` の Range | 全体 200（sha256 一致、`Accept-Ranges: bytes`、`immutable`、`nosniff`、`Content-Disposition: inline`、正しい `Content-Type`）、`bytes=0-99` → 206 + `Content-Range: bytes 0-99/<size>`（内容一致）、`bytes=-100` → 206、範囲外 → 416 + `Content-Range: bytes */<size>`、不正 → 416、拡張子違い / 不明 ID → 404。未公開素材は公開 API に列挙されない（D-01。ID を知れば取得できる点は NFR-9 で許容） | ○ |
+| (e) `.mind` の gzip | 保存ファイルは gzip（`size_bytes` は gzip 後）、`/a/` は `Content-Encoding: gzip` で `Accept-Encoding` の有無によらず 1 回だけ圧縮（Node の Hono `compress` と二重にならないことを curl で確認: 86 B → 展開 71 B = 元サイズ）。展開結果は元の `.mind` と一致。E2E の認識ステップ成功でブラウザ側の透過展開も確認 | ○ |
+| (f) 秘密情報 | `.dev.vars.example` / `.env.example` はキー名のみ。コード・文書・`wrangler.toml` に接続文字列・トークンなし（README の `postgres://...` はプレースホルダ）。`.gitignore` に `.dev.vars`、`.wrangler/`、`dist-worker/`。`.dev.vars` / `.env` は未追跡 | ○ |
+| (g) Workers の CPU 時間の注記 | `docs/04_architecture.md`「コスト上の注意」に「`.mind` の gzip と scrypt は数十 ms かかるため Paid（50 ms〜）が安全」の記載あり。**README には無い**（「Workers Free でも可」とだけ記載）→ R5-M-03 | × |
+| migrate の冪等性 | `npm run migrate` 2 回目 `applied: []`（ラウンド 3 で確認、ロジック変更なし: 埋め込み SQL を `schema_migrations` で管理） | ○ |
+
+## R5-4. 静的レビューで確認した設計上の留意点（不具合ではない）
+
+- Neon HTTP の `tx` はコールバック内の文を集めて 1 回で送るため、トランザクション内で結果を読むコードは書けない。現状の `publishProject` / `unpublish` / `resume` / `deleteProject` は INSERT / UPDATE のみで問題なし（単体テストで組み立てを確認）。
+- `scheduled()` は `waitUntil` で `runCleanup` を実行。素材数が増えた場合の実行時間は実デプロイで観測（Workers の Cron は 15 分、CPU 制限は Paid で 30 秒）。
+- 静的配信は `run_worker_first = true` のため全リクエストが Worker を通る（Worker リクエスト数に計上）。`isApiPath` 以外は DB に触れない。
+- 生ボディの R2 保存は `FixedLengthStream(size)` で長さを与える。本体が `Content-Length` と異なる場合は R2 側で失敗し削除される見込み（Node のローカル保存では切り詰めファイルが残る。R5-M-01）。
+
+## R5-5. 不具合一覧（ラウンド 5 で新規。すべて Minor）
+
+| # | 件名 | 内容 |
+| --- | --- | --- |
+| R5-M-01 | `Content-Length` を実際より小さく偽装した生ボディで、ローカルストレージに切り詰めファイルが残る | Node モード: 100 バイトと申告して 52 KB 送ると 400 で拒否されるが、`projects/<pid>/overlay/<id>`（100 バイト、DB 行なし）が残る。ローカルストレージは `list` 未実装のため Cron の迷子掃除の対象外。R2 では `FixedLengthStream` の長さ不一致で保存が失敗するか、迷子掃除（15 分超、DB に無いオブジェクト）で削除される（メモリアダプタで迷子削除を確認）。対策例: ローカルにも `list` を実装、または保存後に `stat.size !== size` で削除 |
+| R5-M-02 | 10 MB 超のターゲット画像の文言が一般文言 | `KIND_MAX_BYTES` の事前チェックが先に走り「ファイルが大きすぎます（動画 50 MB / 3D 20 MB / 画像 10 MB）」。FR-3-2 の「10 MB 以下の画像にしてください」はブラウザ側の事前チェック（`EditorPage`）では出るため、UI 上の影響は小さい |
+| R5-M-03 | README に Workers の CPU 時間（scrypt / `.mind` gzip が Free の 10 ms を超え得る、Paid 推奨）の記載がない | `docs/04_architecture.md` にはある。README「Cloudflare へのデプロイ」の前提「Workers Free でも可」に注記を追加すること |
+| R5-M-04 | Node モードの `TRUST_PROXY` 既定が `true`（ラウンド 2 の D-22 では `loopback`） | `X-Forwarded-Host` を無条件に信頼するため、プロキシ無しで Node を直接公開すると公開 URL / Origin 検査に影響（自分の QR のみ）。Workers では `trustProxy = false` で影響なし。README の環境変数表に既定 `true` と記載あり。Docker / 直接公開時は `TRUST_PROXY=false` を推奨 |
+| R5-M-05 | JSON 本文の 1 MB 上限が `Content-Length` ヘッダ依存 | `Transfer-Encoding: chunked` の 2 MB JSON は 413 にならず本文を読んでから 400（Node）。Workers では Cloudflare の本文上限（Free 100 MB）が実質の上限。`c.req.json()` の前にサイズ付き読み取りを入れる余地 |
+
+記録: 生ボディ経路（Web クライアントの全アップロード）は `sha256` を持たない（§14 では「ストリーム保存した動画」とあるが、画像 / GLB も同様。`.mind` と multipart は保持）。AC-K6 は配信バイト列と元ファイルの一致（TC-R5-RANGE、TC-K6-01）で確認した。ラウンド 2〜4 の残存 Minor（D-10 / D-13 / D-19 / D-20、D-11 残、R2-01）は継続。
+
+## R5-6. 合格条件: 実デプロイ後にオーナーが確認する項目（最新版）
+
+`d1b590f` 以降を `npm run worker:deploy` でデプロイして実施し、結果をレポートに追記した時点で最終判定とする。実機チェックリスト（§R2-6 の 1〜14）は本番 URL で実施する。
+
+| # | 確認項目 | 期待 |
+| --- | --- | --- |
+| 1 | `https://<host>/healthz` | `{"ok":true,"db":"neon","storage":"r2"}` |
+| 2 | `DATABASE_URL=<Neon pooled> npm run migrate` を 2 回 | 1 回目 `applied: ["001_init.sql"]`、2 回目 `applied: []`。その後 `/api/auth/signup` → 201 |
+| 3 | 作成画面で PNG（ターゲット）/ MP4（**8 MB 超**を含む）/ GLB / `.mind`（解析で自動）をアップロード | すべて 201。Network で `POST /api/projects/:id/assets?kind=...`（本体 + `Content-Length`）。`wrangler tail` に `level: error` なし。R2 ダッシュボードに `projects/<pid>/<kind>/<id>` が生成される |
+| 4 | 不正ファイル（テキストを .mp4 に改名、11 MB の PNG）をアップロード | 400 / 413 で、R2 に残骸が残らない（数分後に R2 一覧を確認。残っていれば 15 分後の Cron で消える） |
+| 5 | `curl -I https://<host>/a/<id>.mp4` と `curl -r 0-99 -D - -o /dev/null https://<host>/a/<id>.mp4` | 200 と `Accept-Ranges: bytes`、206 と `Content-Range: bytes 0-99/<size>`。実機 / PC ブラウザで動画のシークが効く（閲覧ページの動画がループ再生する） |
+| 6 | `curl -D - -o /dev/null https://<host>/a/<id>.mind` | `Content-Encoding: gzip`、`Content-Length` が元の約半分。閲覧ページで認識できる（透過展開） |
+| 7 | `curl -D - -o /dev/null -H 'Accept-Encoding: br' https://<host>/assets/<overlay chunk>.js` と `/api/public/<slug>` | `content-encoding: br`（または gzip）。エッジ圧縮が効いている |
+| 8 | `curl -I https://<host>/v/<slug>`、`/legal.html`、`/foo`（`Accept: text/html`）、`/api/nothing` | `/v/` は viewer.html 200 `cache-control: no-cache` `x-content-type-options: nosniff`、`/legal.html` 200（307 なし）、`/foo` は index.html 200、`/api/nothing` は 404 JSON |
+| 9 | Cron: ダッシュボード → Worker → Settings → Triggers で `*/15 * * * *` を確認。`wrangler tail` で 15 分後のログ | `{"level":"info","message":"cleanup",...}` が 15 分ごとに出る。下書きで素材を差し替えて 15 分以上放置 → 旧素材が R2 から消え、公開版・下書きの素材は残る |
+| 10 | Workers のメトリクス（CPU 時間） | ログイン（scrypt）と `.mind` アップロード（gzip）の CPU 時間を確認。Free の 10 ms を超えて 1102 エラーが出る場合は Paid へ（R5-M-03） |
+| 11 | 公開 → QR → 実機（§R2-6 の 1〜14） | 動画 / 画像 / 3D が表示され、計測が 1 / 1 / 1。D-20（JPEG 登録のチラシ）と許可拒否（項目 14）を含める |
+| 12 | `PUBLIC_ORIGIN` を独自ドメインに設定して再デプロイ後、QR の内容 | QR が `https://<独自ドメイン>/v/<slug>` にデコードされる |
