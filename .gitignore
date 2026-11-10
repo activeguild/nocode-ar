@@ -1,0 +1,16 @@
+node_modules/
+dist/
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+e2e/.fixtures/
+e2e/.out/
+.env
+.DS_Store
+.vercel/
+.dev.vars
+.wrangler/
+dist-worker/

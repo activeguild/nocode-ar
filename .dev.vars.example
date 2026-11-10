@@ -1,0 +1,5 @@
+# wrangler dev 用のローカル秘密情報（このファイルを .dev.vars にコピーして値を入れる。.dev.vars は git 管理外）
+DATABASE_URL=
+CRON_SECRET=
+# PUBLIC_ORIGIN=http://localhost:8787
+# SUPPORT_EMAIL=
