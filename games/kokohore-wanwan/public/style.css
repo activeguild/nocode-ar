@@ -1,0 +1,115 @@
+/* レイアウト: 藍色の夜の地に、畑（キャンバス）を一枚の絵として置き、下に鼻メーター・得点・操作ボタンを一列に並べる */
+:root {
+  color-scheme: dark;
+  --ai: #18203a;        /* 藍: 地 */
+  --ai-2: #232e52;      /* 藍: パネル */
+  --ai-3: #34416e;      /* 藍: 枠線 */
+  --kami: #f7f1df;      /* 和紙: 文字 */
+  --usuzumi: #a9b2d2;   /* 薄墨: 補助文字 */
+  --kin: #f2c14e;       /* 小判の金 */
+  --shu: #e4572e;       /* 朱 */
+  --font-display: 'Dela Gothic One', 'Hiragino Kaku Gothic ProN', 'Yu Gothic', sans-serif;
+  --font-body: 'Zen Maru Gothic', 'Hiragino Maru Gothic ProN', 'Yu Gothic', sans-serif;
+}
+[hidden] { display: none !important; }
+html, body { background: var(--ai); color: var(--kami); }
+body {
+  font-family: var(--font-body);
+  font-weight: 500;
+  font-size: 15px;
+  line-height: 1.6;
+  padding-block: 12px 20px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 900px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
+
+.top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+h1 { font-family: var(--font-display); font-weight: 400; font-size: clamp(22px, 5vw, 34px); margin: 0; color: var(--kin); letter-spacing: .04em; }
+h2 { font-family: var(--font-display); font-weight: 400; font-size: 22px; margin: 0; color: var(--kin); }
+.timer { font-family: var(--font-display); font-size: clamp(22px, 5vw, 34px); font-variant-numeric: tabular-nums; }
+.timer.hurry { color: var(--shu); }
+
+.stage { position: relative; border-radius: 10px; overflow: hidden; border: 3px solid var(--ai-3); background: #6f9d55; }
+canvas { display: block; width: 100%; height: auto; touch-action: none; }
+
+.overlay {
+  position: absolute; inset: 0; overflow-y: auto;
+  display: flex; flex-direction: column; justify-content: center; gap: 12px;
+  padding: 16px clamp(12px, 4vw, 40px);
+  background: rgba(24, 32, 58, .74);
+}
+.lead { margin: 0; color: var(--kami); }
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+.field { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--usuzumi); flex: 1 1 140px; min-width: 0; }
+input {
+  font: inherit; font-size: 16px; color: var(--kami); background: var(--ai); border: 2px solid var(--ai-3);
+  border-radius: 8px; padding: 8px 10px; width: 100%; box-sizing: border-box;
+}
+button {
+  font: inherit; font-weight: 700; color: var(--kami); background: var(--ai-2); border: 2px solid var(--ai-3);
+  border-radius: 8px; padding: 9px 16px; cursor: pointer;
+}
+button:hover { border-color: var(--kin); }
+button.primary { background: var(--kin); border-color: var(--kin); color: var(--ai); }
+button.primary:hover { filter: brightness(1.08); }
+:focus-visible { outline: 3px solid var(--kami); outline-offset: 2px; }
+.err { margin: 0; color: var(--shu); font-weight: 700; }
+
+.breeds { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.breed { text-align: left; padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; font-weight: 500; }
+.breed b { font-size: 15px; }
+.breed .sk { color: var(--kin); font-weight: 700; font-size: 13px; }
+.breed .ds { color: var(--usuzumi); font-size: 12px; line-height: 1.4; }
+.breed[aria-checked="true"] { border-color: var(--kin); background: #2c3a68; }
+.breed .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+
+.lobby-list, .result-list, .scores { list-style: none; margin: 0; padding: 0; }
+.lobby-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.lobby-list li { background: var(--ai-2); border-radius: 8px; padding: 4px 12px; }
+.result-list { display: flex; flex-direction: column; gap: 4px; max-width: 420px; }
+.result-list li { display: flex; gap: 10px; align-items: baseline; padding: 4px 10px; border-radius: 8px; background: var(--ai-2); }
+.result-list li.me { outline: 2px solid var(--kin); }
+.result-list .rank { font-family: var(--font-display); width: 2.2em; }
+.result-list .nm { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.result-list .pt { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--kin); }
+
+.banner {
+  position: absolute; left: 0; right: 0; top: 12%; text-align: center; pointer-events: none;
+  font-family: var(--font-display); font-size: clamp(18px, 4.5vw, 32px); color: var(--kin);
+  text-shadow: 0 3px 0 var(--ai), 0 0 14px var(--ai);
+}
+
+.hud { display: flex; flex-wrap: wrap; gap: 10px; align-items: stretch; }
+.nose { flex: 1 1 200px; min-width: 0; display: flex; align-items: center; gap: 10px; background: var(--ai-2); border-radius: 10px; padding: 8px 12px; }
+.label { font-size: 12px; color: var(--usuzumi); white-space: nowrap; }
+.pips { display: flex; gap: 4px; }
+.pips i { width: 14px; height: 22px; border-radius: 4px; background: var(--ai-3); }
+.nose[data-level="1"] .pips i:nth-child(-n+1),
+.nose[data-level="2"] .pips i:nth-child(-n+2),
+.nose[data-level="3"] .pips i:nth-child(-n+3) { background: var(--kin); }
+.nose[data-level="4"] .pips i { background: var(--shu); }
+.nose-text { font-family: var(--font-display); font-size: 17px; }
+.nose[data-level="4"] .nose-text { color: var(--kin); }
+
+.scores { flex: 2 1 260px; min-width: 0; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.scores li { display: flex; align-items: center; gap: 6px; background: var(--ai-2); border-radius: 999px; padding: 3px 12px 3px 8px; font-size: 13px; }
+.scores li.me { outline: 2px solid var(--kin); }
+.scores .chip { width: 12px; height: 12px; border-radius: 50%; }
+.scores .pt { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--kin); }
+
+.btns { display: flex; gap: 8px; flex: 1 1 220px; }
+.act { flex: 1; min-height: 52px; font-size: 16px; display: flex; flex-direction: column; align-items: center; justify-content: center; line-height: 1.2; user-select: none; -webkit-user-select: none; touch-action: none; }
+.act kbd { font: inherit; font-size: 11px; font-weight: 500; color: var(--usuzumi); }
+.act.skill { border-color: var(--kin); font-size: 14px; white-space: nowrap; }
+.act.skill.cooling { border-color: var(--ai-3); color: var(--usuzumi); }
+.act:active, .act.down { background: var(--ai-3); }
+
+.help { margin: 0; font-size: 12.5px; color: var(--usuzumi); }
+
+@media (max-width: 640px) {
+  .breeds { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .breed .ds { display: none; }
+  .overlay { justify-content: flex-start; }
+  .stage { min-height: 300px; }
+}
