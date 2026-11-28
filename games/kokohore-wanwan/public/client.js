@@ -13,6 +13,9 @@ const DOG = {
   collie: { body: '#2b2b33', ear: '#17171c', belly: '#ffffff' },
 };
 const NOSE_TEXT = ['……', 'クンクン', 'ワン！', 'ワンワン！', 'ここほれ！'];
+const DEEP_TEXT = ['', 'ここほれ！', 'ふかいぞ！', 'すごくふかい！']; // 真上にいるとき、あと何層かで鳴き方が変わる
+const noseText = (me) => (me.sniff === 4 ? DEEP_TEXT[me.layers] || NOSE_TEXT[4] : NOSE_TEXT[me.sniff]);
+const HOLE = ['', '#5a3f27', '#3a2717', '#170e08']; // 穴の底の色。深いほど暗い
 const BOT_NAMES = ['ポチ', 'ハナ', 'ゴン', 'シロ'];
 
 const cv = $('cv');
@@ -294,6 +297,7 @@ function handleEvents() {
     const mine = view.me && e.pid === view.me.id;
     if (e.type === 'find') addText(e.x, e.y, `${Sim.KINDS[e.kind].label} +${e.value}`, '#ffe08a', mine || e.kind === 'chest');
     else if (e.type === 'empty' && mine) addText(e.x, e.y, 'からっぽ', '#e8e2d0', false);
+    else if (e.type === 'deeper' && mine) addText(e.x, e.y, 'まだ下にある！', '#ffe08a', false);
     else if (e.type === 'bees') addText(e.x, e.y, 'ハチだ！', '#ff6b4a', true);
     else if (e.type === 'steal') {
       fx.push({ kind: 'line', x: e.fx * T, y: e.fy * T, x2: e.x * T, y2: e.y * T, t: 0, life: 0.5 });
@@ -318,28 +322,33 @@ function drawField() {
   ctx.fillStyle = '#69964f';
   for (let y = 0; y < Sim.H; y++) for (let x = (y & 1); x < Sim.W; x += 2) ctx.fillRect(x * T, y * T, T, T);
   // 掘りかけ
+  const prog = {};
   for (const [k, sec] of view.prog) {
-    const x = (k % Sim.W) * T + T / 2;
-    const y = Math.floor(k / Sim.W) * T + T / 2;
-    const r = 5 + Math.min(1, sec / 2.6) * 8;
-    ctx.fillStyle = '#8a6a44';
-    ctx.beginPath();
-    ctx.ellipse(x, y + 2, r, r * 0.75, 0, 0, Math.PI * 2);
-    ctx.fill();
+    const r = 4 + Math.min(1, sec / Sim.LAYER_NEED[+view.dug[k]]) * 6;
+    prog[k] = r;
   }
-  // 掘った穴
+  // 掘った穴（深いほど大きく暗い）と、その上の掘りかけ
   for (let k = 0; k < view.dug.length; k++) {
-    if (view.dug[k] !== '1') continue;
+    const d = +view.dug[k];
+    if (!d && !prog[k]) continue;
     const x = (k % Sim.W) * T + T / 2;
     const y = Math.floor(k / Sim.W) * T + T / 2;
-    ctx.fillStyle = '#8a6a44';
-    ctx.beginPath();
-    ctx.ellipse(x, y + 1, 14, 11.5, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#3d2a1a';
-    ctx.beginPath();
-    ctx.ellipse(x, y + 3, 10.5, 7.5, 0, 0, Math.PI * 2);
-    ctx.fill();
+    if (d) {
+      ctx.fillStyle = '#8a6a44';
+      ctx.beginPath();
+      ctx.ellipse(x, y + 1, 10 + d * 1.6, 8 + d * 1.4, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = HOLE[d];
+      ctx.beginPath();
+      ctx.ellipse(x, y + 3, 6.5 + d * 1.6, 4.5 + d * 1.2, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    if (prog[k]) {
+      ctx.fillStyle = d ? HOLE[Math.min(3, d + 1)] : '#8a6a44';
+      ctx.beginPath();
+      ctx.ellipse(x, y + 3, prog[k], prog[k] * 0.72, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 }
 function drawRevealed(now) {
@@ -353,7 +362,7 @@ function drawRevealed(now) {
     ctx.beginPath();
     ctx.arc(x, y, 11 * pulse, 0, Math.PI * 2);
     ctx.stroke();
-    label(Sim.KINDS[it.kind].label, x, y - 16, 11, bees ? '#ffb4a3' : '#fff3c4');
+    label(`${Sim.KINDS[it.kind].label} 深${it.depth}`, x, y - 16, 11, bees ? '#ffb4a3' : '#fff3c4');
   }
 }
 function label(text, x, y, size, color) {
@@ -487,7 +496,7 @@ function drawPlayer(p, s, now, dt) {
   }
   label(p.name, px, py - 27 - (p.stun ? 8 : 0), 11, me ? '#ffffff' : '#e8ecff');
   // 吹き出しが自分の名前に重ならないよう、犬が近いときは名前の上に出す
-  if (me && lvl > 0) bubble(NOSE_TEXT[lvl], dogX, Math.abs(dogX - px) < 34 ? Math.min(dogY - 22 - hop, py - 44) : dogY - 22 - hop, lvl);
+  if (me && lvl > 0) bubble(noseText(view.me), dogX, Math.abs(dogX - px) < 34 ? Math.min(dogY - 22 - hop, py - 44) : dogY - 22 - hop, lvl);
 }
 function bubble(text, x, y, lvl) {
   ctx.font = `700 ${lvl === 4 ? 14 : 11}px "Zen Maru Gothic", sans-serif`;
@@ -543,7 +552,7 @@ function updateHud() {
   $('timer').classList.toggle('hurry', view.time <= 30 && view.phase === 'play');
   const lvl = view.me ? view.me.sniff : 0;
   $('nose').dataset.level = lvl;
-  $('noseText').textContent = NOSE_TEXT[lvl];
+  $('noseText').textContent = view.me ? noseText(view.me) : NOSE_TEXT[0];
   const ranked = [...view.players].sort((a, b) => b.score - a.score);
   const key = ranked.map((p) => `${p.id}:${p.score}`).join(',');
   if (key !== hudKey) {

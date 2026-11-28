@@ -7,7 +7,8 @@ const H = 16;
 const MATCH = 120; // 1試合の秒数
 const FINALE_AT = 30; // 残り何秒で千両箱が追加されるか
 const SPEED = 4.2; // マス/秒
-const EMPTY_NEED = 0.8; // 何も無いマスを掘り切る秒数
+const MAX_DEPTH = 3; // 1マスを何層まで掘れるか
+const LAYER_NEED = [0.8, 1.1, 1.5]; // 1層目・2層目・3層目を掘り切る秒数（深いほど固い）
 
 const BREEDS = {
   shiba: { name: '柴犬', skill: 'ここほれレーダー', cd: 14, desc: '5秒間、近くに埋まっている物が見える' },
@@ -16,11 +17,12 @@ const BREEDS = {
   collie: { name: 'ボーダーコリー', skill: 'よこどり', cd: 22, desc: '近くの相手から得点の10%をうばう' },
 };
 
+// depth: 埋まっている層の候補 [層, その層になる確率] 。深いほど高い物が出る
 const KINDS = {
-  coin: { v: 10, need: 0.9, label: '小判' },
-  pot: { v: 30, need: 1.4, label: 'つぼ' },
-  chest: { v: 100, need: 2.6, label: '千両箱' },
-  bees: { v: 0, need: 0.9, label: 'ハチの巣' },
+  coin: { v: 10, label: '小判', depth: [[1, 0.8], [2, 1]] },
+  pot: { v: 30, label: 'つぼ', depth: [[2, 0.75], [3, 1]] },
+  chest: { v: 100, label: '千両箱', depth: [[3, 1]] },
+  bees: { v: 0, label: 'ハチの巣', depth: [[1, 0.5], [2, 1]] },
 };
 
 const RADAR_R = 5.5;
@@ -50,10 +52,14 @@ function placeItem(g, kind) {
     const x = Math.floor(rnd(g) * W);
     const y = Math.floor(rnd(g) * H);
     const k = y * W + x;
-    if (g.dug[k] || g.itemAt[k] >= 0) continue;
+    if (g.dug[k] >= MAX_DEPTH || g.itemAt[k] >= 0) continue;
     if (g.players.some((p) => Math.floor(p.x) === x && Math.floor(p.y) === y)) continue;
+    const r = rnd(g);
+    const pick = KINDS[kind].depth.find((d) => r < d[1])[0];
+    // すでに掘られた穴の、さらに下に湧くこともある
+    const depth = Math.max(pick, g.dug[k] + 1);
     g.itemAt[k] = g.items.length;
-    g.items.push({ x, y, kind, found: false });
+    g.items.push({ x, y, kind, depth, found: false });
     return true;
   }
   return false;
@@ -94,7 +100,7 @@ function createGame(seed, roster) {
       buff: 0,
       reveal: 0,
       digging: false,
-      ai: { tx: -1, ty: -1, wait: rnd(g), smart: 0.3 + rnd(g) * 0.25 },
+      ai: { tx: -1, ty: -1, until: 0, known: false, wait: rnd(g), smart: 0.3 + rnd(g) * 0.25 },
     });
   });
   for (let i = 0; i < 26; i++) placeItem(g, 'coin');
@@ -143,8 +149,9 @@ function useSkill(g, p) {
   pushEvent(g, 'skill', { pid: p.id, breed: p.breed, x: p.x, y: p.y });
 }
 
-function finishDig(g, p, k, tx, ty) {
-  g.dug[k] = 1;
+// 1層掘り終えたとき。その層に物があれば掘り当て、もっと下にあれば「まだ下」
+function finishLayer(g, p, k, tx, ty) {
+  g.dug[k]++;
   delete g.prog[k];
   p.digging = false;
   const ii = g.itemAt[k];
@@ -153,6 +160,10 @@ function finishDig(g, p, k, tx, ty) {
     return;
   }
   const it = g.items[ii];
+  if (it.depth > g.dug[k]) {
+    pushEvent(g, 'deeper', { pid: p.id, x: tx, y: ty });
+    return;
+  }
   it.found = true;
   g.itemAt[k] = -1;
   if (it.kind === 'bees') {
@@ -172,7 +183,10 @@ function botInput(g, p, dt) {
     a.wait -= dt;
     return inp;
   }
-  if (a.tx < 0 || g.dug[a.ty * W + a.tx]) {
+  const tk = a.ty * W + a.tx;
+  // 狙った財宝が出るまで掘り下げる。当てずっぽうのときは1層だけ掘って次へ
+  if (a.tx < 0 || g.dug[tk] >= a.until || (a.known && g.itemAt[tk] < 0)) {
+    a.known = false;
     // 次に掘る場所を決める。鼻が利く範囲の財宝を smart の確率で当て、外れは近場を適当に掘る
     let best = null;
     let bd = 4.5;
@@ -187,15 +201,18 @@ function botInput(g, p, dt) {
     if (best && rnd(g) < a.smart) {
       a.tx = best.x;
       a.ty = best.y;
+      a.known = true;
+      a.until = MAX_DEPTH;
     } else {
       const far = !best;
       for (let i = 0; i < 30; i++) {
         const r = far ? 9 : 3;
         const x = Math.floor(p.x + (rnd(g) * 2 - 1) * r);
         const y = Math.floor(p.y + (rnd(g) * 2 - 1) * r);
-        if (x < 0 || y < 0 || x >= W || y >= H || g.dug[y * W + x]) continue;
+        if (x < 0 || y < 0 || x >= W || y >= H || g.dug[y * W + x] >= MAX_DEPTH) continue;
         a.tx = x;
         a.ty = y;
+        a.until = g.dug[y * W + x] + 1;
         break;
       }
     }
@@ -273,15 +290,13 @@ function step(g, inputs, dt) {
       const tx = Math.floor(p.x);
       const ty = Math.floor(p.y);
       const k = ty * W + tx;
-      if (g.dug[k]) {
+      if (g.dug[k] >= MAX_DEPTH) {
         p.digging = false;
       } else {
         // 掘った量はマスに残る。途中でやめると、あとから来た人に横取りされる
         p.digging = true;
         g.prog[k] = (g.prog[k] || 0) + dt * (p.buff > 0 ? 3 : 1);
-        const ii = g.itemAt[k];
-        const need = ii >= 0 ? KINDS[g.items[ii].kind].need : EMPTY_NEED;
-        if (g.prog[k] >= need) finishDig(g, p, k, tx, ty);
+        if (g.prog[k] >= LAYER_NEED[g.dug[k]]) finishLayer(g, p, k, tx, ty);
       }
     } else {
       p.digging = false;
@@ -306,6 +321,13 @@ function sniff(g, p) {
     if (d < best) best = d;
   }
   return best <= 1.6 ? 3 : best <= 3.2 ? 2 : best <= 5.5 ? 1 : 0;
+}
+
+// 足もとの財宝まであと何層か（0=足もとには無い）。ハチの巣には犬は反応しない
+function layersBelow(g, p) {
+  const k = Math.floor(p.y) * W + Math.floor(p.x);
+  const it = g.items[g.itemAt[k]];
+  return it && it.kind !== 'bees' ? it.depth - g.dug[k] : 0;
 }
 
 // プレイヤーごとに見せてよい情報だけを取り出す（埋まっている場所はサーバから出さない）
@@ -335,16 +357,16 @@ function viewFor(g, pid) {
       buff: p.buff > 0,
     })),
     me: me
-      ? { id: me.id, cd: r2(me.cd), cdMax: BREEDS[me.breed].cd, reveal: me.reveal > 0, sniff: sniff(g, me) }
+      ? { id: me.id, cd: r2(me.cd), cdMax: BREEDS[me.breed].cd, reveal: me.reveal > 0, sniff: sniff(g, me), layers: layersBelow(g, me) }
       : null,
     revealed:
       me && me.reveal > 0
         ? g.items
             .filter((it) => !it.found && dist(it.x + 0.5, it.y + 0.5, me.x, me.y) <= RADAR_R)
-            .map((it) => ({ x: it.x, y: it.y, kind: it.kind }))
+            .map((it) => ({ x: it.x, y: it.y, kind: it.kind, depth: it.depth }))
         : [],
     events: g.events,
   };
 }
 
-export { W, H, MATCH, BREEDS, KINDS, BARK_R, RADAR_R, createGame, step, viewFor };
+export { W, H, MATCH, MAX_DEPTH, LAYER_NEED, BREEDS, KINDS, BARK_R, RADAR_R, createGame, step, viewFor };
