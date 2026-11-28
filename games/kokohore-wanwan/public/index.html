@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ここほれワンワン</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Dela+Gothic+One&family=Zen+Maru+Gothic:wght@500;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<!--BODY-->
+<div class="wrap">
+  <header class="top">
+    <h1>ここほれワンワン</h1>
+    <div class="timer" id="timer" aria-label="残り時間">2:00</div>
+  </header>
+
+  <div class="stage">
+    <canvas id="cv" aria-label="畑"></canvas>
+    <div class="banner" id="banner" hidden></div>
+
+    <section class="overlay" id="menu">
+      <p class="lead">犬の鼻をたよりに畑を掘って、120秒でいちばん稼いだ人の勝ち。深く掘るほど大物が出ます。</p>
+      <div class="breeds" id="breeds" role="radiogroup" aria-label="相棒の犬"></div>
+      <div class="row">
+        <label class="field">なまえ<input id="name" maxlength="10" value="はなさか" autocomplete="off"></label>
+        <button class="primary" id="btnSolo">CPUと対戦</button>
+      </div>
+      <div class="row online" id="onlineRow" hidden>
+        <label class="field">合言葉<input id="room" maxlength="12" placeholder="例: wan123" autocomplete="off"></label>
+        <button id="btnOnline">友だちと対戦</button>
+      </div>
+      <p class="err" id="menuErr" hidden></p>
+    </section>
+
+    <section class="overlay" id="lobby" hidden>
+      <h2>待合室 <span id="lobbyCode"></span></h2>
+      <p class="lead">このページのURLを送ると、同じ部屋に入れます。4人に足りない分はCPUが入ります。</p>
+      <ul class="lobby-list" id="lobbyList"></ul>
+      <div class="row">
+        <button id="btnCopy">URLをコピー</button>
+        <button class="primary" id="btnStart">対戦をはじめる</button>
+      </div>
+    </section>
+
+    <section class="overlay" id="result" hidden>
+      <h2 id="resultTitle">結果</h2>
+      <ol class="result-list" id="resultList"></ol>
+      <div class="row">
+        <button id="btnMenu">犬をえらび直す</button>
+        <button class="primary" id="btnAgain">もう一回</button>
+      </div>
+    </section>
+  </div>
+
+  <div class="hud">
+    <div class="nose" id="nose" data-level="0">
+      <span class="label">犬の鼻</span>
+      <span class="pips"><i></i><i></i><i></i><i></i></span>
+      <span class="nose-text" id="noseText">……</span>
+    </div>
+    <ol class="scores" id="scores"></ol>
+    <div class="btns">
+      <button class="act" id="btnDig">ほる<kbd>Space</kbd></button>
+      <button class="act skill" id="btnSkill"><span id="skillName">スキル</span><kbd>E</kbd></button>
+    </div>
+  </div>
+
+  <p class="help">移動: WASD / 矢印キー（スマホは畑をなぞる）。犬が「ここほれ！」と鳴いたマスで掘ると財宝。1マスは3層まで掘れて、深いほど高い物が出ます（「ふかいぞ！」は2層下）。掘りかけの穴は他の人に横取りされます。ハチの巣に注意。</p>
+</div>
+<!--/BODY-->
+<script type="module" src="client.js"></script>
+</body>
+</html>

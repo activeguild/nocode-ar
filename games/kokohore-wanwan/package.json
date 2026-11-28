@@ -1,0 +1,9 @@
+{
+  "name": "kokohore-wanwan",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "build:single": "node build-single.mjs"
+  }
+}
